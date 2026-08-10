@@ -159,6 +159,7 @@ class SequenceArchiverApp:
         self.login_icon_photos = {}
         self._workspace_shell_cache = None
         self._workspace_sidebar_nav_controller = None
+        self.file_operation_active = False
         self.login_connectivity = {
             "dot_canvas": None,
             "dot_item": None,
@@ -302,26 +303,28 @@ class SequenceArchiverApp:
         self._set_fullscreen(not self._force_fullscreen)
 
     def _is_file_operation_active(self):
-        for flag_name in (
-            "is_file_operation_active",
-            "file_operation_active",
-            "is_uploading",
-            "upload_in_progress",
-            "save_in_progress",
-        ):
-            if bool(getattr(self, flag_name, False)):
-                return True
-        return False
+        return bool(self.file_operation_active)
+
+    def _show_file_operation_blocked_message(self):
+        messagebox.showwarning(
+            "파일 작업 진행 중",
+            "파일 업로드가 진행 중입니다. 작업이 완료된 후 다시 시도해 주세요.",
+            parent=self.root,
+        )
+
+    def begin_file_operation(self):
+        if self._is_file_operation_active():
+            return False
+        self.file_operation_active = True
+        return True
+
+    def end_file_operation(self):
+        self.file_operation_active = False
 
     def exit_application(self):
         if self._is_file_operation_active():
-            should_exit = messagebox.askyesno(
-                "종료 확인",
-                "파일 작업이 아직 진행 중입니다. 지금 종료하면 업로드 또는 저장 작업이 중단될 수 있습니다. 종료하시겠습니까?",
-                parent=self.root,
-            )
-            if not should_exit:
-                return
+            self._show_file_operation_blocked_message()
+            return
 
         try:
             self.clear_workspace(unmap_if_needed=True)
@@ -869,6 +872,11 @@ class SequenceArchiverApp:
                 "Database is not initialized."
             )
 
+        if self._is_file_operation_active():
+            raise RuntimeError(
+                "A file operation is active. Cannot switch workspace right now."
+            )
+
         normalized_workspace = str(
             workspace or ""
         ).strip()
@@ -924,6 +932,9 @@ class SequenceArchiverApp:
         )
 
     def clear_workspace(self, unmap_if_needed=False):
+        if self._is_file_operation_active():
+            self._show_file_operation_blocked_message()
+            return False
 
         if unmap_if_needed and self.workspace_drive_mapped_by_app and state.active_workspace_drive:
             self.workspace_manager.unmap_drive(state.active_workspace_drive)
@@ -932,17 +943,20 @@ class SequenceArchiverApp:
         state.active_workspace_id = None
         state.active_workspace_drive = ""
         self.workspace_drive_mapped_by_app = False
+        return True
 
     def logout_and_return_to_login(self):
         # Ensure mapped workspace drive is released before logging out.
-        self.clear_workspace(unmap_if_needed=True)
+        if not self.clear_workspace(unmap_if_needed=True):
+            return
         state.is_demo_mode = False
         clear_session_login()
         clear_saved_credentials()
         self.show_login_screen()
 
     def leave_workspace_to_selection(self):
-        self.clear_workspace(unmap_if_needed=True)
+        if not self.clear_workspace(unmap_if_needed=True):
+            return
         self.show_workspace_selection_screen()
 
     def show_startup_screen(self):
@@ -1103,6 +1117,9 @@ class SequenceArchiverApp:
         return ui_show_change_server_name_dialog(self, parent_win)
 
     def show_settings_screen(self):
+        if self._is_file_operation_active():
+            self._show_file_operation_blocked_message()
+            return
         return ui_show_settings_screen(self)
 
     def run(self):

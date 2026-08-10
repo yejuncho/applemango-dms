@@ -17,12 +17,8 @@ WS_TEXT_SECONDARY = colors.TEXT_SECONDARY
 
 def show_workspace_selection_screen(app):
     app._stop_login_connectivity_polling()
-    if state.active_workspace_drive and app.workspace_drive_mapped_by_app:
-        app.workspace_manager.unmap_drive(state.active_workspace_drive)
-    state.active_workspace = ""
-    state.active_workspace_id = None
-    state.active_workspace_drive = ""
-    app.workspace_drive_mapped_by_app = False
+    if not app.clear_workspace(unmap_if_needed=True):
+        return
 
     app._center_window(760, 680)
     app.root.title("애플망고 DMS - 워크스페이스 선택")

@@ -11,6 +11,7 @@ import shutil
 import threading
 import hashlib
 import mimetypes
+import uuid
 from tkinter import filedialog
 import applemango_dms.config as config
 import applemango_dms.state as state
@@ -327,6 +328,9 @@ def show_save_files_screen(app):
         if folder:
             add_folder_paths([folder])
 
+    def normalize_share_path(value):
+        return str(value or "").strip().replace("/", "\\").rstrip("\\").casefold()
+
     def is_upload_destination_safe(destination):
         if state.is_demo_mode:
             return True
@@ -335,6 +339,36 @@ def show_save_files_screen(app):
         drive_letter = normalize_drive_letter(state.active_workspace_drive)
 
         if not workspace_name or not drive_letter:
+            return False
+
+        try:
+            current_workspace_id = int(
+                getattr(state, "active_workspace_id", None)
+            )
+            expected_workspace_id = int(workspace_id)
+        except (TypeError, ValueError):
+            print("SAFE FAILED: invalid active workspace id")
+            return False
+
+        if current_workspace_id != expected_workspace_id:
+            print(
+                "SAFE FAILED: active workspace id mismatch",
+                current_workspace_id,
+                expected_workspace_id,
+            )
+            return False
+
+        try:
+            workspace_row = app.db.get_workspace_by_id(
+                expected_workspace_id,
+                require_active=True,
+            )
+        except Exception as exc:
+            print("SAFE FAILED: workspace lookup error", exc)
+            return False
+
+        if workspace_row is None:
+            print("SAFE FAILED: workspace record not found", expected_workspace_id)
             return False
 
         mapped = get_mapped_network_drives()
@@ -360,16 +394,28 @@ def show_save_files_screen(app):
             return False
 
         remote_server = parts[0].lower()
-        remote_share = parts[1].lower()
         expected_server = (config.default_server_name or "").strip("\\").lower()
 
         if expected_server and remote_server != expected_server:
             print("SAFE FAILED: server mismatch")
             return False
-        
-        #if remote_share != workspace_name:
-        #    print("SAFE FAILED: share/workspace mismatch")
-        #    return False
+
+        normalized_remote_unc = normalize_share_path(remote_unc)
+        normalized_registered_share = normalize_share_path(
+            workspace_row.get("share_path")
+        )
+
+        if not normalized_registered_share:
+            print("SAFE FAILED: empty registered share_path")
+            return False
+
+        if normalized_remote_unc != normalized_registered_share:
+            print(
+                "SAFE FAILED: mapped UNC and registered share_path mismatch",
+                normalized_remote_unc,
+                normalized_registered_share,
+            )
+            return False
 
         destination_drive = normalize_drive_letter(getattr(destination, "drive", ""))
 
@@ -417,6 +463,10 @@ def show_save_files_screen(app):
         if not targets:
             return None
 
+        if app._is_file_operation_active():
+            app._show_file_operation_blocked_message()
+            return None
+
         destination = app.get_workspace_root_path()
         if destination is None:
             for row_key in targets:
@@ -438,6 +488,10 @@ def show_save_files_screen(app):
             refresh_row3_rows()
             return None
 
+        if not app.begin_file_operation():
+            app._show_file_operation_blocked_message()
+            return None
+
         for row_key in targets:
             set_row_upload_state(row_key, status_code="uploading", progress_ratio=0.0)
         refresh_row3_rows()
@@ -453,157 +507,211 @@ def show_save_files_screen(app):
                         hasher.update(block)
                 return hasher.hexdigest()
 
-            reserved_names = set()
-            for row_key in target_rows:
-                source = Path(row_key)
-                row_state = row_metadata_state.setdefault(row_key, {})
-                doc_type = str(
-                    row_state.get("document_type")
-                    or default_document_type_name
-                ).strip()
-                
-                tags = row_state.get("tags") or ""
+            try:
+                reserved_names = set()
+                for row_key in target_rows:
+                    source = Path(row_key)
+                    row_state = row_metadata_state.setdefault(row_key, {})
+                    doc_type = str(
+                        row_state.get("document_type")
+                        or default_document_type_name
+                    ).strip()
 
-                destination_path = None
-                database_saved = False
+                    tags = row_state.get("tags") or ""
 
-                try:
-                    selected_document_date = row_state.get("date_iso")
+                    destination_path = None
+                    staging_path = None
+                    final_published = False
+                    database_saved = False
 
-                    if not selected_document_date:
-                        raise ValueError(
-                            "A complete document date is required."
-                        )
+                    try:
+                        selected_document_date = row_state.get("date_iso")
 
-                    document_type_id = (
-                        document_type_id_by_name.get(
-                            doc_type
-                        )
-                    )
-                    if document_type_id is None:
-                        raise LookupError(
-                            "Selected document type is no longer "
-                            "active in this workspace."
-                        )
-                    if not source.exists() or not source.is_file():
-                        raise FileNotFoundError(f"source missing: {source}")
-
-                    candidate_name = app.filename_builder.build_filename(
-                        selected_document_date,
-                        doc_type,
-                        tags,
-                        source.name,
-                    )
-                    archived_name = app.filename_builder.ensure_unique_name(destination, candidate_name, reserved_names=reserved_names)
-                    destination_path = destination / archived_name
-
-                    total_size = max(1, source.stat().st_size)
-                    copied_size = 0
-                    checksum_hasher = hashlib.sha256()
-
-                    with source.open("rb") as src_f, destination_path.open("xb") as dst_f:
-                        while True:
-                            chunk = src_f.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            dst_f.write(chunk)
-                            checksum_hasher.update(chunk)
-                            copied_size += len(chunk)
-                            ratio = copied_size / float(total_size)
-                            app.root.after(0, lambda key=row_key, r=ratio: (set_row_upload_state(key, status_code="uploading", progress_ratio=r), refresh_row3_rows()))
-
-                        dst_f.flush()
-                        os.fsync(dst_f.fileno())
-
-                    source_checksum = checksum_hasher.hexdigest()
-                    destination_checksum = compute_sha256(destination_path)
-                    if destination_checksum != source_checksum:
-                        raise IOError(
-                            "Copied file failed integrity verification "
-                            f"(source={source_checksum}, destination={destination_checksum})."
-                        )
-
-                    shutil.copystat(source, destination_path)
-
-                    relative_path = destination_path.relative_to(destination)
-
-                    source_stat = source.stat()
-                    mime_type, _ = mimetypes.guess_type(source.name)
-
-                    tag_names = [
-                        value.strip()
-                        for value in re.split(r"[,;]", tags)
-                        if value.strip()
-                    ]
-
-                    app.db.create_file_with_tags(
-                        {
-                            "workspace_id": workspace_id,
-                            "document_type_id": document_type_id,
-                            "uploaded_by": (
-                                state.session_account_name
-                                or state.session_username
-                                or "unknown"
-                            ),
-                            "original_filename": source.name,
-                            "archived_filename": archived_name,
-                            "relative_path": str(relative_path),
-                            "document_date": selected_document_date,
-                            "source_created_at": datetime.fromtimestamp(
-                                source_stat.st_ctime
-                            ).isoformat(timespec="seconds"),
-                            "source_modified_at": datetime.fromtimestamp(
-                                source_stat.st_mtime
-                            ).isoformat(timespec="seconds"),
-                            "file_ext": source.suffix,
-                            "mime_type": mime_type,
-                            "file_size": destination_path.stat().st_size,
-                            "checksum": source_checksum,
-                        },
-                        tag_names,
-                    )
-
-                    database_saved = True
-
-                    app.root.after(0, lambda key=row_key: (set_row_upload_state(key, status_code="success", progress_ratio=1.0), refresh_row3_rows()))
- 
-                except Exception as exc:
-                    if (
-                        not database_saved
-                        and destination_path is not None
-                        and destination_path.exists()
-                    ):
-                        try:
-                            destination_path.unlink()
-                        except OSError as cleanup_exc:
-                            print(
-                                f"Failed to remove incomplete upload "
-                                f"{destination_path}: {cleanup_exc}"
+                        if not selected_document_date:
+                            raise ValueError(
+                                "A complete document date is required."
                             )
-                    print(
-                        f"Upload failed for {source}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
 
-                    app.root.after(
-                        0,
-                        lambda key=row_key, message=str(exc): (
-                            row_metadata_state.setdefault(
-                                key,
-                                {},
-                            ).update(
-                                {"error_message": message}
-                            ),
-                            set_row_upload_state(
-                                key,
-                                status_code="failed",
-                                progress_ratio=0.0,
-                            ),
-                            refresh_row3_rows(),
-                        ),
-                    )
+                        document_type_id = (
+                            document_type_id_by_name.get(
+                                doc_type
+                            )
+                        )
+                        if document_type_id is None:
+                            raise LookupError(
+                                "Selected document type is no longer "
+                                "active in this workspace."
+                            )
+                        if not source.exists() or not source.is_file():
+                            raise FileNotFoundError(f"source missing: {source}")
 
-        threading.Thread(target=upload_worker, args=(targets,), daemon=True).start()
+                        candidate_name = app.filename_builder.build_filename(
+                            selected_document_date,
+                            doc_type,
+                            tags,
+                            source.name,
+                        )
+                        archived_name = app.filename_builder.ensure_unique_name(
+                            destination,
+                            candidate_name,
+                            reserved_names=reserved_names,
+                        )
+                        destination_path = destination / archived_name
+                        staging_path = destination / f".__applemango_upload_{uuid.uuid4().hex}.part"
+
+                        total_size = max(1, source.stat().st_size)
+                        copied_size = 0
+                        checksum_hasher = hashlib.sha256()
+
+                        with source.open("rb") as src_f, staging_path.open("xb") as dst_f:
+                            while True:
+                                chunk = src_f.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                dst_f.write(chunk)
+                                checksum_hasher.update(chunk)
+                                copied_size += len(chunk)
+                                ratio = copied_size / float(total_size)
+                                app.root.after(0, lambda key=row_key, r=ratio: (set_row_upload_state(key, status_code="uploading", progress_ratio=r), refresh_row3_rows()))
+
+                            dst_f.flush()
+                            os.fsync(dst_f.fileno())
+
+                        source_checksum = checksum_hasher.hexdigest()
+                        staging_checksum = compute_sha256(staging_path)
+                        if staging_checksum != source_checksum:
+                            raise IOError(
+                                "Copied file failed integrity verification "
+                                f"(source={source_checksum}, destination={staging_checksum})."
+                            )
+
+                        shutil.copystat(source, staging_path)
+
+                        resolve_attempts = 0
+                        while destination_path.exists():
+                            archived_name = app.filename_builder.ensure_unique_name(
+                                destination,
+                                candidate_name,
+                                reserved_names=reserved_names,
+                            )
+                            destination_path = destination / archived_name
+                            resolve_attempts += 1
+                            if resolve_attempts >= 32 and destination_path.exists():
+                                raise FileExistsError(
+                                    "Unable to resolve a unique archive name before publication."
+                                )
+
+                        os.replace(staging_path, destination_path)
+                        final_published = True
+                        staging_path = None
+
+                        relative_path = destination_path.relative_to(destination)
+
+                        source_stat = source.stat()
+                        mime_type, _ = mimetypes.guess_type(source.name)
+
+                        tag_names = [
+                            value.strip()
+                            for value in re.split(r"[,;]", tags)
+                            if value.strip()
+                        ]
+
+                        app.db.create_file_with_tags(
+                            {
+                                "workspace_id": workspace_id,
+                                "document_type_id": document_type_id,
+                                "uploaded_by": (
+                                    state.session_account_name
+                                    or state.session_username
+                                    or "unknown"
+                                ),
+                                "original_filename": source.name,
+                                "archived_filename": archived_name,
+                                "relative_path": str(relative_path),
+                                "document_date": selected_document_date,
+                                "source_created_at": datetime.fromtimestamp(
+                                    source_stat.st_ctime
+                                ).isoformat(timespec="seconds"),
+                                "source_modified_at": datetime.fromtimestamp(
+                                    source_stat.st_mtime
+                                ).isoformat(timespec="seconds"),
+                                "file_ext": source.suffix,
+                                "mime_type": mime_type,
+                                "file_size": destination_path.stat().st_size,
+                                "checksum": source_checksum,
+                            },
+                            tag_names,
+                        )
+
+                        database_saved = True
+
+                        app.root.after(0, lambda key=row_key: (set_row_upload_state(key, status_code="success", progress_ratio=1.0), refresh_row3_rows()))
+
+                    except Exception as exc:
+                        if staging_path is not None and staging_path.exists():
+                            try:
+                                staging_path.unlink()
+                            except OSError as cleanup_exc:
+                                print(
+                                    f"Failed to remove staging upload file "
+                                    f"{staging_path}: {cleanup_exc}"
+                                )
+
+                        if (
+                            final_published
+                            and not database_saved
+                            and destination_path is not None
+                            and destination_path.exists()
+                        ):
+                            try:
+                                destination_path.unlink()
+                            except OSError as cleanup_exc:
+                                print(
+                                    f"Failed to remove unpublished archive file "
+                                    f"{destination_path}: {cleanup_exc}"
+                                )
+
+                        print(
+                            f"Upload failed for {source}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+                        app.root.after(
+                            0,
+                            lambda key=row_key, message=str(exc): (
+                                row_metadata_state.setdefault(
+                                    key,
+                                    {},
+                                ).update(
+                                    {"error_message": message}
+                                ),
+                                set_row_upload_state(
+                                    key,
+                                    status_code="failed",
+                                    progress_ratio=0.0,
+                                ),
+                                refresh_row3_rows(),
+                            ),
+                        )
+            finally:
+                app.end_file_operation()
+
+        try:
+            worker_thread = threading.Thread(
+                target=upload_worker,
+                args=(targets,),
+                daemon=True,
+            )
+            worker_thread.start()
+        except Exception as exc:
+            app.end_file_operation()
+            print(
+                f"Upload worker start failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            for row_key in targets:
+                set_row_upload_state(row_key, status_code="failed", progress_ratio=0.0)
+            refresh_row3_rows()
         return None
 
     def create_rounded_action(

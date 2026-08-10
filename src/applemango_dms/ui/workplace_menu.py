@@ -360,6 +360,10 @@ def build_sidebar_nav(app, parent, active_key, items, icon_photos=None):
             if key == nav_state["active_key"]:
                 return "break"
 
+            if app._is_file_operation_active():
+                app._show_file_operation_blocked_message()
+                return "break"
+
             set_active_navigation(key)
             nav_state["navigating"] = True
 
