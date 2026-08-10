@@ -1065,27 +1065,6 @@ class ArchiveDatabase:
                     "Reserved document type cannot be deactivated."
                 )
 
-            in_use = conn.execute(
-                """
-                SELECT 1
-                FROM files
-                WHERE workspace_id = ?
-                  AND document_type_id = ?
-                  AND status = ?
-                LIMIT 1;
-                """,
-                (
-                    normalized_workspace_id,
-                    normalized_document_type_id,
-                    self.STATUS_ACTIVE,
-                ),
-            ).fetchone()
-
-            if in_use is not None:
-                raise ValueError(
-                    "Document type is still used by active files."
-                )
-
             conn.execute(
                 """
                 UPDATE document_types
