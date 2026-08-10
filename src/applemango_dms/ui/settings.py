@@ -42,6 +42,9 @@ WORKSPACE_DESIGNATION_WINDOW_WIDTH = 880
 WORKSPACE_DESIGNATION_WINDOW_HEIGHT = 560
 WORKSPACE_DESIGNATION_MIN_WIDTH = 760
 WORKSPACE_DESIGNATION_MIN_HEIGHT = 460
+WORKSPACE_DESIGNATION_STATUS_COL_WIDTH = 120
+WORKSPACE_DESIGNATION_ACTION_COL_WIDTH = 140
+WORKSPACE_DESIGNATION_COL_GAP = 12
 
 WORKSPACE_STATUS_BADGE_STYLES = {
     WORKSPACE_STATUS_ACTIVE: {
@@ -365,9 +368,17 @@ def show_workspace_designation_window(app, parent_win=None):
 
     header_row = tk.Frame(table_card, bg=SETTINGS_CARD_BG, padx=14, pady=10)
     header_row.pack(fill="x")
-    header_row.grid_columnconfigure(0, weight=7)
-    header_row.grid_columnconfigure(1, weight=2)
-    header_row.grid_columnconfigure(2, weight=2)
+    header_row.grid_columnconfigure(0, weight=1)
+    header_row.grid_columnconfigure(
+        1,
+        weight=0,
+        minsize=WORKSPACE_DESIGNATION_STATUS_COL_WIDTH,
+    )
+    header_row.grid_columnconfigure(
+        2,
+        weight=0,
+        minsize=WORKSPACE_DESIGNATION_ACTION_COL_WIDTH,
+    )
 
     tk.Label(
         header_row,
@@ -385,7 +396,12 @@ def show_workspace_designation_window(app, parent_win=None):
         fg=SETTINGS_TEXT_SECONDARY,
         font=app._font(10, "bold"),
         anchor="w",
-    ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+    ).grid(
+        row=0,
+        column=1,
+        sticky="w",
+        padx=(WORKSPACE_DESIGNATION_COL_GAP, 0),
+    )
 
     tk.Label(
         header_row,
@@ -394,7 +410,12 @@ def show_workspace_designation_window(app, parent_win=None):
         fg=SETTINGS_TEXT_SECONDARY,
         font=app._font(10, "bold"),
         anchor="w",
-    ).grid(row=0, column=2, sticky="w", padx=(8, 0))
+    ).grid(
+        row=0,
+        column=2,
+        sticky="w",
+        padx=(WORKSPACE_DESIGNATION_COL_GAP, 0),
+    )
 
     tk.Frame(
         table_card,
@@ -530,9 +551,17 @@ def show_workspace_designation_window(app, parent_win=None):
                 bd=0,
             )
             item.pack(fill="x")
-            item.grid_columnconfigure(0, weight=7)
-            item.grid_columnconfigure(1, weight=2)
-            item.grid_columnconfigure(2, weight=2)
+            item.grid_columnconfigure(0, weight=1)
+            item.grid_columnconfigure(
+                1,
+                weight=0,
+                minsize=WORKSPACE_DESIGNATION_STATUS_COL_WIDTH,
+            )
+            item.grid_columnconfigure(
+                2,
+                weight=0,
+                minsize=WORKSPACE_DESIGNATION_ACTION_COL_WIDTH,
+            )
 
             workspace_cell = tk.Frame(item, bg=row_bg, highlightthickness=0, bd=0)
             workspace_cell.grid(row=0, column=0, sticky="ew")
@@ -568,7 +597,12 @@ def show_workspace_designation_window(app, parent_win=None):
                 font=app._font(9, "bold"),
                 padx=10,
                 pady=4,
-            ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+            ).grid(
+                row=0,
+                column=1,
+                sticky="w",
+                padx=(WORKSPACE_DESIGNATION_COL_GAP, 0),
+            )
 
             action_spec = _workspace_action_from_row(row)
             if action_spec is None:
@@ -579,7 +613,12 @@ def show_workspace_designation_window(app, parent_win=None):
                     fg=SETTINGS_TEXT_SECONDARY,
                     font=app._font(10),
                     anchor="w",
-                ).grid(row=0, column=2, sticky="w", padx=(8, 0))
+                ).grid(
+                    row=0,
+                    column=2,
+                    sticky="w",
+                    padx=(WORKSPACE_DESIGNATION_COL_GAP, 0),
+                )
             else:
                 tk.Button(
                     item,
@@ -593,7 +632,12 @@ def show_workspace_designation_window(app, parent_win=None):
                     bd=0,
                     highlightthickness=0,
                     cursor="hand2",
-                ).grid(row=0, column=2, sticky="w", padx=(8, 0))
+                ).grid(
+                    row=0,
+                    column=2,
+                    sticky="w",
+                    padx=(WORKSPACE_DESIGNATION_COL_GAP, 0),
+                )
 
             if idx < len(rows) - 1:
                 tk.Frame(

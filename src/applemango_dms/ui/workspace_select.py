@@ -111,7 +111,6 @@ def show_workspace_selection_screen(app):
     surface_window = list_shell.create_window(0, 0, window=stack_surface, anchor="nw")
 
     stack_canvas = tk.Canvas(stack_surface, bg=WS_CARD_BG, highlightthickness=0, bd=0)
-    stack_canvas.pack(side="left", fill="both", expand=True, padx=(0, 2), pady=(2, 0))
 
     def enter_workspace(selected):
         selected_name = str(
@@ -210,8 +209,11 @@ def show_workspace_selection_screen(app):
         app.show_main_workspace_menu()
 
     if not shares:
+        empty_shell = tk.Frame(stack_surface, bg=WS_CARD_BG)
+        empty_shell.pack(fill="both", expand=True, padx=24, pady=24)
+
         empty_label = tk.Label(
-            stack_surface,
+            empty_shell,
             text=(
                 "사용하도록 지정된 워크스페이스가 없습니다.\n"
                 "설정에서 워크스페이스를 추가해 주세요."
@@ -219,11 +221,18 @@ def show_workspace_selection_screen(app):
             bg=WS_CARD_BG,
             fg=WS_TEXT_SECONDARY,
             font=app._font(11),
-            anchor="w",
+            anchor="center",
+            justify="center",
         )
-        empty_label.pack(anchor="w", padx=24, pady=24)
+        empty_label.pack(expand=True)
+
+        def on_empty_shell_configure(event):
+            empty_label.configure(wraplength=max(260, int(event.width) - 48))
+
+        empty_shell.bind("<Configure>", on_empty_shell_configure)
         workspace_stack = None
     else:
+        stack_canvas.pack(side="left", fill="both", expand=True, padx=(0, 2), pady=(2, 0))
         workspace_stack = WorkspaceStack(
             stack_canvas,
             shares,
