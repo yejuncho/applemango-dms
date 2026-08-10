@@ -28,6 +28,8 @@ DT_TEXT_PRIMARY = colors.TEXT_PRIMARY
 
 DT_PRIMARY = colors.SECONDARY_STRONG
 DT_PRIMARY_HOVER = colors.SECONDARY_STRONG_HOVER
+DT_ACTION_PRIMARY = colors.PRIMARY
+DT_ACTION_PRIMARY_HOVER = colors.PRIMARY_HOVER
 DT_SELECTED_BG = colors.SURFACE_HOVER_SOFT
 DT_SELECTED_SEPARATOR = colors.SURFACE_HOVER_SOFT
 
@@ -59,8 +61,37 @@ DT_TABLE_HEADER_HEIGHT = 38
 DT_ADD_BUTTON_HEIGHT = 46
 DT_VISIBLE_ACTIVE_ROWS = 5
 DT_ACTIVE_TABLE_ROWS_WITH_ADD_BUTTON = 4
-DT_VISIBLE_INACTIVE_ROWS = 1
-DT_INACTIVE_CARD_MIN_HEIGHT = 146
+DT_VISIBLE_INACTIVE_ROWS = 2
+DT_INACTIVE_CARD_MIN_HEIGHT = (
+    DT_ACTIVE_ROW_HEIGHT
+    * DT_VISIBLE_INACTIVE_ROWS
+    + 50
+)
+
+DT_LAYOUT_TOP_ROW_MINSIZE = 56
+DT_LAYOUT_MIDDLE_ROW_MINSIZE = 342
+DT_DETAIL_CARD_HEIGHT_INCREASE_RATIO = 0.20
+DT_DETAIL_CARD_EXTENSION_BOTTOM_TRIM = max(
+    0,
+    DT_INACTIVE_CARD_MIN_HEIGHT
+    - int(
+        round(
+            (
+                DT_LAYOUT_TOP_ROW_MINSIZE
+                + DT_LAYOUT_MIDDLE_ROW_MINSIZE
+            )
+            * DT_DETAIL_CARD_HEIGHT_INCREASE_RATIO
+        )
+    ),
+)
+DT_DETAIL_TITLE_BOTTOM_GAP = 12
+DT_ACTION_BUTTON_ICON_SIZE = 16
+DT_ACTION_BUTTON_PADX = 12
+DT_ACTION_BUTTON_ICON_GAP = 8
+DT_ACTION_BUTTON_HEIGHT = 40
+DT_ACTION_BUTTON_RADIUS = 11
+DT_ACTION_BUTTON_FONT_SIZE = 11
+DT_MIDDLE_CARD_BOTTOM_CUT = 10
 
 DT_TABLE_COLUMN_WIDTHS = {
     "grip": 38,
@@ -499,18 +530,60 @@ def _create_status_badge(
     text,
     kind,
 ):
+    success_soft = getattr(
+        colors,
+        "SUCCESS_SOFT",
+        None,
+    )
+    if not success_soft:
+        try:
+            success_soft = _blend_hex(
+                colors.SURFACE_ALT,
+                colors.SUCCESS_STRONG,
+                0.18,
+            )
+        except Exception:
+            success_soft = colors.SURFACE_HOVER_SOFT
+
+    danger_soft = getattr(
+        colors,
+        "FAILED_SOFT",
+        None,
+    )
+    if not danger_soft:
+        danger_soft = getattr(
+            colors,
+            "SURFACE_DANGER_HOVER",
+            None,
+        )
+    if not danger_soft:
+        try:
+            danger_soft = _blend_hex(
+                colors.SURFACE_ALT,
+                colors.FAILED_STRONG,
+                0.14,
+            )
+        except Exception:
+            danger_soft = colors.SURFACE_HOVER
+
+    neutral_soft = getattr(
+        colors,
+        "NUMBER_DESIGNATION_BG",
+        colors.SURFACE_HOVER,
+    )
+
     palette = {
         "active": {
-            "bg": DT_SUCCESS_SOFT,
+            "bg": success_soft,
             "fg": colors.SUCCESS_STRONG,
         },
         "system": {
-            "bg": colors.SURFACE_HOVER,
+            "bg": neutral_soft,
             "fg": colors.TEXT_SECONDARY,
         },
         "inactive": {
-            "bg": colors.SURFACE_HOVER,
-            "fg": colors.TEXT_PLACEHOLDER,
+            "bg": danger_soft,
+            "fg": colors.FAILED_STRONG,
         },
     }
 
@@ -519,20 +592,48 @@ def _create_status_badge(
         palette["inactive"],
     )
 
-    badge = tk.Label(
+    badge_width = 84
+    badge_height = 28
+    badge_radius = 10
+
+    badge = tk.Canvas(
         parent,
-        text=text,
-        font=app._font(11, "bold"),
-        fg=selected["fg"],
-        bg=selected["bg"],
-        width=8,
-        anchor="center",
-        justify="center",
-        padx=10,
-        pady=4,
+        width=badge_width,
+        height=badge_height,
+        bg=parent.cget("bg"),
         bd=0,
         highlightthickness=0,
     )
+
+    def _render(_event=None):
+        badge.delete("status_badge")
+        app._smooth_rounded_rect(
+            badge,
+            1,
+            1,
+            badge_width - 2,
+            badge_height - 2,
+            badge_radius,
+            fill=selected["bg"],
+            outline=selected["bg"],
+            width=1,
+            tags="status_badge",
+        )
+        badge.create_text(
+            int(badge_width / 2),
+            int(badge_height / 2),
+            text=text,
+            font=app._font(11, "bold"),
+            fill=selected["fg"],
+            tags="status_badge",
+        )
+
+    badge.bind(
+        "<Configure>",
+        _render,
+        add="+",
+    )
+    _render()
 
     return badge
 
@@ -976,6 +1077,25 @@ def _bind_mousewheel_to_canvas(
     canvas,
 ):
     def on_mousewheel(event):
+        bbox = canvas.bbox("all")
+        if bbox is None:
+            canvas.yview_moveto(0)
+            return "break"
+
+        content_height = max(
+            0,
+            int(bbox[3] - bbox[1]),
+        )
+        viewport_height = max(
+            0,
+            int(canvas.winfo_height()),
+        )
+
+        if content_height <= viewport_height:
+            # Keep short lists pinned to the top; no blank space above row 1.
+            canvas.yview_moveto(0)
+            return "break"
+
         delta = getattr(
             event,
             "delta",
@@ -1000,6 +1120,36 @@ def _bind_mousewheel_to_canvas(
         canvas.unbind_all(
             "<MouseWheel>",
         )
+
+    def bind_if_pointer_inside():
+        try:
+            pointer_x = int(widget.winfo_pointerx())
+            pointer_y = int(widget.winfo_pointery())
+            root_x = int(widget.winfo_rootx())
+            root_y = int(widget.winfo_rooty())
+            width = int(widget.winfo_width())
+            height = int(widget.winfo_height())
+        except Exception:
+            return
+
+        if width <= 0 or height <= 0:
+            return
+
+        if (
+            root_x <= pointer_x < (root_x + width)
+            and root_y <= pointer_y < (root_y + height)
+        ):
+            bind_all()
+
+    # Ensure first scroll works even when cursor starts over the table
+    # before an initial <Enter> event fires.
+    widget.after_idle(bind_if_pointer_inside)
+
+    widget.bind(
+        "<MouseWheel>",
+        on_mousewheel,
+        add="+",
+    )
 
     widget.bind(
         "<Enter>",
@@ -1352,12 +1502,12 @@ def show_document_type_management_screen(app):
     layout.grid_rowconfigure(
         0,
         weight=0,
-        minsize=62,
+        minsize=DT_LAYOUT_TOP_ROW_MINSIZE,
     )
     layout.grid_rowconfigure(
         1,
         weight=5,
-        minsize=342,
+        minsize=DT_LAYOUT_MIDDLE_ROW_MINSIZE,
     )
     layout.grid_rowconfigure(
         2,
@@ -1403,7 +1553,11 @@ def show_document_type_management_screen(app):
         column=0,
         sticky="nsew",
         padx=(6, DT_CARD_GAP // 2),
-        pady=(0, DT_CARD_GAP // 2),
+        pady=(
+            0,
+            (DT_CARD_GAP // 2)
+            + DT_MIDDLE_CARD_BOTTOM_CUT,
+        ),
     )
 
     bottom_card["canvas"].grid(
@@ -1411,16 +1565,20 @@ def show_document_type_management_screen(app):
         column=0,
         sticky="nsew",
         padx=(6, DT_CARD_GAP // 2),
-        pady=(DT_CARD_GAP // 2, 0),
+        pady=(0, 2),
     )
 
     detail_card["canvas"].grid(
         row=0,
         column=1,
-        rowspan=2,
+        rowspan=3,
         sticky="nsew",
-        padx=(DT_CARD_GAP // 2, 0),
-        pady=(0, DT_CARD_GAP // 2),
+        padx=(0, 0),
+        pady=(
+            0,
+            (DT_CARD_GAP // 2)
+            + DT_DETAIL_CARD_EXTENSION_BOTTOM_TRIM,
+        ),
     )
 
 
@@ -1730,9 +1888,30 @@ def show_document_type_management_screen(app):
         )
 
         def sync_scrollregion(_event=None):
+            bbox = canvas.bbox("all")
+            if bbox is None:
+                canvas.configure(
+                    scrollregion=(0, 0, 0, 0)
+                )
+                canvas.yview_moveto(0)
+                return
+
             canvas.configure(
-                scrollregion=canvas.bbox("all")
+                scrollregion=bbox
             )
+
+            content_height = max(
+                0,
+                int(bbox[3] - bbox[1]),
+            )
+            viewport_height = max(
+                0,
+                int(canvas.winfo_height()),
+            )
+
+            if content_height <= viewport_height:
+                # Reset stale scroll offsets after filtering to a short list.
+                canvas.yview_moveto(0)
 
         def sync_rows_width(event):
             canvas.itemconfigure(
@@ -1861,6 +2040,83 @@ def show_document_type_management_screen(app):
 
     add_button = active_section.get("add_button")
 
+    def load_action_icon(
+        icon_name,
+        *,
+        tint,
+    ):
+        icon = _load_svg_if_present(
+            DOCUMENT_TYPE_ICON_DIR
+            / f"{icon_name}.svg",
+            max_width=DT_ACTION_BUTTON_ICON_SIZE,
+            max_height=DT_ACTION_BUTTON_ICON_SIZE,
+            tint=tint,
+        )
+        if icon is None:
+            icon = icon_photos.get(icon_name)
+        return icon
+
+    action_button_icons = {
+        "rename_enabled": load_action_icon(
+            "edit",
+            tint=DT_TEXT_ON_ACCENT,
+        ),
+        "rename_disabled": (
+            load_action_icon(
+                "edit_muted",
+                tint=DT_DISABLED_TEXT,
+            )
+            or load_action_icon(
+                "edit",
+                tint=DT_DISABLED_TEXT,
+            )
+        ),
+        "deactivate_enabled": load_action_icon(
+            "deactivate",
+            tint=DT_DANGER,
+        ),
+        "deactivate_disabled": load_action_icon(
+            "deactivate",
+            tint=DT_DISABLED_TEXT,
+        ),
+        "recover_enabled": load_action_icon(
+            "recover",
+            tint=DT_SUCCESS,
+        ),
+        "recover_disabled": load_action_icon(
+            "recover",
+            tint=DT_DISABLED_TEXT,
+        ),
+        "move_up_enabled": load_action_icon(
+            "move_up",
+            tint=DT_TEXT_MUTED,
+        ),
+        "move_up_disabled": (
+            load_action_icon(
+                "move_up_muted",
+                tint=DT_DISABLED_TEXT,
+            )
+            or load_action_icon(
+                "move_up",
+                tint=DT_DISABLED_TEXT,
+            )
+        ),
+        "move_down_enabled": load_action_icon(
+            "move_down",
+            tint=DT_TEXT_MUTED,
+        ),
+        "move_down_disabled": (
+            load_action_icon(
+                "move_down_muted",
+                tint=DT_DISABLED_TEXT,
+            )
+            or load_action_icon(
+                "move_down",
+                tint=DT_DISABLED_TEXT,
+            )
+        ),
+    }
+
     detail_body = detail_card["body"]
     detail_widgets = {}
     screen_state["detail_widgets"] = detail_widgets
@@ -1868,11 +2124,14 @@ def show_document_type_management_screen(app):
     tk.Label(
         detail_body,
         text="문서 유형 상세",
-        font=app._font(13, "bold"),
+        font=app._font(14, "bold"),
         fg=DT_TEXT_TITLE,
         bg=DT_CARD_BG,
         anchor="w",
-    ).pack(fill="x")
+    ).pack(
+        fill="x",
+        pady=(0, DT_DETAIL_TITLE_BOTTOM_GAP),
+    )
 
     detail_placeholder = tk.Label(
         detail_body,
@@ -2038,82 +2297,282 @@ def show_document_type_management_screen(app):
         pady=(8, 12),
     )
 
-    tk.Label(
-        detail_content,
-        text="작업",
-        font=app._font(11, "bold"),
-        fg=DT_TEXT_TITLE,
-        bg=DT_CARD_BG,
-        anchor="w",
-    ).pack(
-        fill="x",
-        pady=(0, 10),
-    )
-
     actions_box = tk.Frame(
         detail_content,
         bg=DT_CARD_BG,
     )
     actions_box.pack(fill="x")
 
-    rename_button = tk.Button(
+    def create_detail_action_button(
+        parent,
+        *,
+        text,
+    ):
+        canvas = tk.Canvas(
+            parent,
+            height=DT_ACTION_BUTTON_HEIGHT,
+            bg=DT_CARD_BG,
+            highlightthickness=0,
+            bd=0,
+            cursor="arrow",
+        )
+
+        state = {
+            "text": text,
+            "icon": None,
+            "variant": "disabled_primary",
+            "enabled": False,
+            "hover": False,
+            "command": lambda: None,
+        }
+
+        def resolve_palette():
+            variant = state["variant"]
+            hover = (
+                bool(state["hover"])
+                and bool(state["enabled"])
+            )
+
+            if variant == "primary":
+                return {
+                    "fill": (
+                        DT_ACTION_PRIMARY_HOVER
+                        if hover
+                        else DT_ACTION_PRIMARY
+                    ),
+                    "border": DT_ACTION_PRIMARY_HOVER,
+                    "text": DT_TEXT_ON_ACCENT,
+                }
+
+            if variant == "outline_danger":
+                return {
+                    "fill": (
+                        colors.SURFACE_DANGER_HOVER
+                        if hover
+                        else DT_CARD_BG
+                    ),
+                    "border": DT_DANGER,
+                    "text": DT_DANGER,
+                }
+
+            if variant == "outline_success":
+                return {
+                    "fill": (
+                        DT_SUCCESS_SOFT
+                        if hover
+                        else DT_CARD_BG
+                    ),
+                    "border": DT_SUCCESS,
+                    "text": DT_SUCCESS,
+                }
+
+            if variant == "outline_neutral":
+                return {
+                    "fill": (
+                        colors.SURFACE_HOVER
+                        if hover
+                        else DT_CARD_BG
+                    ),
+                    "border": DT_CARD_BORDER,
+                    "text": DT_TEXT_TITLE,
+                }
+
+            if variant == "disabled_outline_danger":
+                return {
+                    "fill": DT_CARD_BG,
+                    "border": DT_DANGER,
+                    "text": DT_DISABLED_TEXT,
+                }
+
+            if variant == "disabled_outline_success":
+                return {
+                    "fill": DT_CARD_BG,
+                    "border": DT_SUCCESS,
+                    "text": DT_DISABLED_TEXT,
+                }
+
+            if variant == "disabled_outline_neutral":
+                return {
+                    "fill": DT_CARD_BG,
+                    "border": DT_CARD_BORDER,
+                    "text": DT_DISABLED_TEXT,
+                }
+
+            return {
+                "fill": DT_DISABLED_BG,
+                "border": DT_CARD_BORDER,
+                "text": DT_DISABLED_TEXT,
+            }
+
+        def render(_event=None):
+            canvas.delete("action_btn")
+
+            width = max(
+                140,
+                int(canvas.winfo_width()),
+            )
+            height = max(
+                DT_ACTION_BUTTON_HEIGHT,
+                int(canvas.winfo_height()),
+            )
+            palette = resolve_palette()
+
+            app._smooth_rounded_rect(
+                canvas,
+                1,
+                1,
+                width - 1,
+                height - 1,
+                DT_ACTION_BUTTON_RADIUS,
+                fill=palette["fill"],
+                outline=palette["border"],
+                width=1,
+                tags="action_btn",
+            )
+
+            font_value = app._font(
+                DT_ACTION_BUTTON_FONT_SIZE,
+                "bold",
+            )
+            text_value = str(state["text"])
+            text_width = tkfont.Font(
+                font=font_value
+            ).measure(text_value)
+
+            icon = state["icon"]
+            icon_width = 0
+            if icon is not None:
+                try:
+                    icon_width = int(icon.width())
+                except Exception:
+                    icon_width = 0
+
+            icon_gap = (
+                DT_ACTION_BUTTON_ICON_GAP
+                if icon_width > 0
+                else 0
+            )
+            content_width = (
+                icon_width
+                + icon_gap
+                + text_width
+            )
+            content_left = max(
+                DT_ACTION_BUTTON_PADX,
+                int((width - content_width) / 2),
+            )
+            center_y = int(height / 2)
+
+            if icon_width > 0 and icon is not None:
+                canvas.create_image(
+                    content_left + int(icon_width / 2),
+                    center_y,
+                    image=icon,
+                    tags="action_btn",
+                )
+
+            canvas.create_text(
+                content_left + icon_width + icon_gap,
+                center_y,
+                text=text_value,
+                anchor="w",
+                fill=palette["text"],
+                font=font_value,
+                tags="action_btn",
+            )
+
+            canvas.configure(
+                cursor=(
+                    "hand2"
+                    if state["enabled"]
+                    else "arrow"
+                )
+            )
+
+        def on_enter(_event):
+            if not state["enabled"]:
+                return
+            state["hover"] = True
+            render()
+
+        def on_leave(_event):
+            if not state["hover"]:
+                return
+            state["hover"] = False
+            render()
+
+        def on_click(_event):
+            if state["enabled"] and callable(
+                state["command"]
+            ):
+                state["command"]()
+
+        def set_style(
+            *,
+            text,
+            icon,
+            variant,
+            enabled,
+        ):
+            state["text"] = text
+            state["icon"] = icon
+            state["variant"] = variant
+            state["enabled"] = bool(enabled)
+            if not state["enabled"]:
+                state["hover"] = False
+            render()
+
+        def set_command(new_command):
+            state["command"] = (
+                new_command
+                if callable(new_command)
+                else (lambda: None)
+            )
+
+        canvas.bind(
+            "<Configure>",
+            render,
+            add="+",
+        )
+        canvas.bind("<Enter>", on_enter)
+        canvas.bind("<Leave>", on_leave)
+        canvas.bind("<Button-1>", on_click)
+
+        canvas.set_style = set_style
+        canvas.set_command = set_command
+        render()
+        return canvas
+
+    rename_button = create_detail_action_button(
         actions_box,
         text="이름 수정",
-        font=app._font(10, "bold"),
-        relief="flat",
-        bd=0,
-        highlightthickness=0,
-        cursor="hand2",
-        pady=8,
-        command=lambda: None,
     )
     rename_button.pack(
         fill="x",
         pady=(0, 8),
     )
 
-    toggle_active_button = tk.Button(
+    toggle_active_button = create_detail_action_button(
         actions_box,
         text="비활성화",
-        font=app._font(10, "bold"),
-        relief="flat",
-        bd=0,
-        highlightthickness=1,
-        cursor="hand2",
-        pady=8,
-        command=lambda: None,
     )
     toggle_active_button.pack(
         fill="x",
         pady=(0, 8),
     )
 
-    move_up_button = tk.Button(
+    move_up_button = create_detail_action_button(
         actions_box,
         text="위로 이동",
-        font=app._font(10, "bold"),
-        relief="flat",
-        bd=0,
-        highlightthickness=1,
-        cursor="hand2",
-        pady=8,
-        command=lambda: None,
     )
     move_up_button.pack(
         fill="x",
         pady=(0, 8),
     )
 
-    move_down_button = tk.Button(
+    move_down_button = create_detail_action_button(
         actions_box,
         text="아래로 이동",
-        font=app._font(10, "bold"),
-        relief="flat",
-        bd=0,
-        highlightthickness=1,
-        cursor="hand2",
-        pady=8,
-        command=lambda: None,
     )
     move_down_button.pack(fill="x")
 
@@ -2137,53 +2596,74 @@ def show_document_type_management_screen(app):
         }
     )
 
-    def style_primary_action(button, text):
-        button.configure(
+    def style_primary_action(
+        button,
+        text,
+        *,
+        icon=None,
+    ):
+        button.set_style(
             text=text,
-            state="normal",
-            cursor="hand2",
-            fg=DT_TEXT_ON_ACCENT,
-            bg=DT_PRIMARY,
-            activeforeground=DT_TEXT_ON_ACCENT,
-            activebackground=DT_PRIMARY_HOVER,
-            highlightthickness=0,
+            icon=icon,
+            variant="primary",
+            enabled=True,
         )
 
     def style_outline_action(
         button,
         *,
         text,
+        icon=None,
         fg,
         border,
         active_bg,
     ):
-        button.configure(
+        if border == DT_DANGER:
+            variant = "outline_danger"
+        elif border == DT_SUCCESS:
+            variant = "outline_success"
+        else:
+            variant = "outline_neutral"
+
+        button.set_style(
             text=text,
-            state="normal",
-            cursor="hand2",
-            fg=fg,
-            bg=DT_CARD_BG,
-            activeforeground=fg,
-            activebackground=active_bg,
-            highlightthickness=1,
-            highlightbackground=border,
-            highlightcolor=border,
-            disabledforeground=DT_DISABLED_TEXT,
+            icon=icon,
+            variant=variant,
+            enabled=True,
         )
 
-    def style_disabled_action(button, text):
-        button.configure(
+    def style_disabled_action(
+        button,
+        text,
+        *,
+        icon=None,
+    ):
+        button.set_style(
             text=text,
-            state="disabled",
-            cursor="arrow",
-            fg=DT_DISABLED_TEXT,
-            bg=DT_DISABLED_BG,
-            activeforeground=DT_DISABLED_TEXT,
-            activebackground=DT_DISABLED_BG,
-            disabledforeground=DT_DISABLED_TEXT,
-            highlightthickness=1,
-            highlightbackground=DT_CARD_BORDER,
-            highlightcolor=DT_CARD_BORDER,
+            icon=icon,
+            variant="disabled_primary",
+            enabled=False,
+        )
+
+    def style_disabled_outline_action(
+        button,
+        text,
+        *,
+        icon=None,
+        border,
+    ):
+        if border == DT_DANGER:
+            variant = "disabled_outline_danger"
+        elif border == DT_SUCCESS:
+            variant = "disabled_outline_success"
+        else:
+            variant = "disabled_outline_neutral"
+
+        button.set_style(
+            text=text,
+            icon=icon,
+            variant=variant,
+            enabled=False,
         )
 
     def set_detail_placeholder_visible(is_visible):
@@ -2346,20 +2826,24 @@ def show_document_type_management_screen(app):
             style_primary_action(
                 detail_widgets["rename_button"],
                 "이름 수정",
+                icon=action_button_icons[
+                    "rename_enabled"
+                ],
             )
             detail_widgets[
                 "rename_button"
-            ].configure(
-                command=on_rename_document_type,
-            )
+            ].set_command(on_rename_document_type)
         else:
             style_disabled_action(
                 detail_widgets["rename_button"],
                 "이름 수정",
+                icon=action_button_icons[
+                    "rename_disabled"
+                ],
             )
             detail_widgets[
                 "rename_button"
-            ].configure(command=lambda: None)
+            ].set_command(lambda: None)
 
         if is_active:
             if (
@@ -2367,55 +2851,69 @@ def show_document_type_management_screen(app):
                 or len(data_state["active"]) <= 1
                 or data_state["error"]
             ):
-                style_disabled_action(
+                style_disabled_outline_action(
                     detail_widgets[
                         "toggle_active_button"
                     ],
                     "비활성화",
+                    icon=action_button_icons[
+                        "deactivate_disabled"
+                    ],
+                    border=DT_DANGER,
                 )
                 detail_widgets[
                     "toggle_active_button"
-                ].configure(command=lambda: None)
+                ].set_command(lambda: None)
             else:
                 style_outline_action(
                     detail_widgets[
                         "toggle_active_button"
                     ],
                     text="비활성화",
+                    icon=action_button_icons[
+                        "deactivate_enabled"
+                    ],
                     fg=DT_DANGER,
                     border=DT_DANGER,
                     active_bg=colors.SURFACE_DANGER_HOVER,
                 )
                 detail_widgets[
                     "toggle_active_button"
-                ].configure(
-                    command=on_deactivate_document_type,
+                ].set_command(
+                    on_deactivate_document_type
                 )
         else:
             if is_system or data_state["error"]:
-                style_disabled_action(
+                style_disabled_outline_action(
                     detail_widgets[
                         "toggle_active_button"
                     ],
                     "복원",
+                    icon=action_button_icons[
+                        "recover_disabled"
+                    ],
+                    border=DT_SUCCESS,
                 )
                 detail_widgets[
                     "toggle_active_button"
-                ].configure(command=lambda: None)
+                ].set_command(lambda: None)
             else:
                 style_outline_action(
                     detail_widgets[
                         "toggle_active_button"
                     ],
                     text="복원",
+                    icon=action_button_icons[
+                        "recover_enabled"
+                    ],
                     fg=DT_SUCCESS,
                     border=DT_SUCCESS,
                     active_bg=DT_SUCCESS_SOFT,
                 )
                 detail_widgets[
                     "toggle_active_button"
-                ].configure(
-                    command=on_reactivate_document_type,
+                ].set_command(
+                    on_reactivate_document_type
                 )
 
         if (
@@ -2423,51 +2921,63 @@ def show_document_type_management_screen(app):
             or row_order <= 1
             or data_state["error"]
         ):
-            style_disabled_action(
+            style_disabled_outline_action(
                 detail_widgets["move_up_button"],
                 "위로 이동",
+                icon=action_button_icons[
+                    "move_up_disabled"
+                ],
+                border=DT_CARD_BORDER,
             )
             detail_widgets[
                 "move_up_button"
-            ].configure(command=lambda: None)
+            ].set_command(lambda: None)
         else:
             style_outline_action(
                 detail_widgets["move_up_button"],
                 text="위로 이동",
+                icon=action_button_icons[
+                    "move_up_enabled"
+                ],
                 fg=DT_TEXT_TITLE,
                 border=DT_CARD_BORDER,
                 active_bg=colors.SURFACE_HOVER,
             )
             detail_widgets[
                 "move_up_button"
-            ].configure(
-                command=on_move_document_type_up,
-            )
+            ].set_command(on_move_document_type_up)
 
         if (
             row_order is None
             or row_order >= row_last
             or data_state["error"]
         ):
-            style_disabled_action(
+            style_disabled_outline_action(
                 detail_widgets["move_down_button"],
                 "아래로 이동",
+                icon=action_button_icons[
+                    "move_down_disabled"
+                ],
+                border=DT_CARD_BORDER,
             )
             detail_widgets[
                 "move_down_button"
-            ].configure(command=lambda: None)
+            ].set_command(lambda: None)
         else:
             style_outline_action(
                 detail_widgets["move_down_button"],
                 text="아래로 이동",
+                icon=action_button_icons[
+                    "move_down_enabled"
+                ],
                 fg=DT_TEXT_TITLE,
                 border=DT_CARD_BORDER,
                 active_bg=colors.SURFACE_HOVER,
             )
             detail_widgets[
                 "move_down_button"
-            ].configure(
-                command=on_move_document_type_down,
+            ].set_command(
+                on_move_document_type_down
             )
 
     screen_state[
