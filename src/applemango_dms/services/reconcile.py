@@ -5,6 +5,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from applemango_dms.services.file_operations import (
+    FileOperationsService,
+)
+
 ProgressCallback = Callable[[dict], None]
 
 
@@ -22,6 +26,12 @@ class WorkspaceReconciliationService:
         "completed_with_errors"
     )
 
+    MANAGED_TRASH_DIRNAME = (
+        FileOperationsService.WORKSPACE_TRASH_DIRNAME
+    )
+    UPLOAD_STAGING_PREFIX = ".__applemango_upload_"
+    UPLOAD_STAGING_SUFFIX = ".part"
+
     def __init__(self, database):
         if database is None:
             raise ValueError("database is required.")
@@ -29,6 +39,7 @@ class WorkspaceReconciliationService:
         required_methods = (
             "get_workspace_file_index",
             "insert_discovered_file_record",
+            "reconcile_file_statuses",
         )
 
         missing_methods = [
@@ -112,6 +123,8 @@ class WorkspaceReconciliationService:
                 "inserted_count": 0,
                 "skipped_count": 0,
                 "failed_count": 0,
+                "marked_missing_count": 0,
+                "restored_active_count": 0,
                 "remaining_unindexed_count": 0,
                 "remaining_missing_count": 0,
                 "scan_error_count": 0,
@@ -222,6 +235,53 @@ class WorkspaceReconciliationService:
             }
         )
 
+        status_reconciliation_result = (
+            self.database.reconcile_file_statuses(
+                normalized_workspace_id
+            )
+        )
+
+        workflow[
+            "status_reconciliation"
+        ] = status_reconciliation_result
+
+        workflow["summary"].update(
+            {
+                "marked_missing_count": int(
+                    status_reconciliation_result.get(
+                        "marked_missing",
+                        0,
+                    )
+                ),
+                "restored_active_count": int(
+                    status_reconciliation_result.get(
+                        "restored_active",
+                        0,
+                    )
+                ),
+            }
+        )
+
+        self._emit_progress(
+            progress_callback,
+            {
+                "event": "status_reconciled",
+                "workspace_id": normalized_workspace_id,
+                "marked_missing": workflow["summary"][
+                    "marked_missing_count"
+                ],
+                "restored_active": workflow["summary"][
+                    "restored_active_count"
+                ],
+                "checked": int(
+                    status_reconciliation_result.get(
+                        "checked",
+                        0,
+                    )
+                ),
+            },
+        )
+
         verification_scan = self.scan_workspace(
             normalized_workspace_id,
             root_path,
@@ -329,10 +389,20 @@ class WorkspaceReconciliationService:
                     for entry in entries:
                         try:
                             if entry.is_dir(follow_symlinks=False):
+                                if self._is_excluded_directory_name(
+                                    entry.name
+                                ):
+                                    continue
+
                                 directory_stack.append(Path(entry.path))
                                 continue
 
                             if not entry.is_file(follow_symlinks=False):
+                                continue
+
+                            if self._is_excluded_file_name(
+                                entry.name
+                            ):
                                 continue
 
                             file_record = self._build_file_record(
@@ -445,6 +515,14 @@ class WorkspaceReconciliationService:
             database_record = database_index[
                 normalized_path
             ]
+
+            database_status = str(
+                database_record.get("status")
+                or ""
+            ).strip().casefold()
+
+            if database_status == "missing":
+                continue
 
             report["missing_from_storage"].append(
                 dict(database_record)
@@ -754,6 +832,44 @@ class WorkspaceReconciliationService:
                 stat_result.st_mtime
             ),
         }
+
+    @classmethod
+    def _is_excluded_directory_name(
+        cls,
+        directory_name,
+    ):
+        normalized_name = str(
+            directory_name or ""
+        ).strip().casefold()
+
+        if not normalized_name:
+            return False
+
+        return (
+            normalized_name
+            == cls.MANAGED_TRASH_DIRNAME.casefold()
+        )
+
+    @classmethod
+    def _is_excluded_file_name(
+        cls,
+        file_name,
+    ):
+        normalized_name = str(
+            file_name or ""
+        ).strip()
+
+        if not normalized_name:
+            return False
+
+        return (
+            normalized_name.startswith(
+                cls.UPLOAD_STAGING_PREFIX
+            )
+            and normalized_name.endswith(
+                cls.UPLOAD_STAGING_SUFFIX
+            )
+        )
 
     @staticmethod
     def _normalize_workspace_id(workspace_id):

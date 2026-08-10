@@ -35,6 +35,7 @@ class FileOperationsService:
     }
 
     _maximum_filename_length = 220
+    WORKSPACE_TRASH_DIRNAME = ".applemango_trash"
 
     def __init__(self, database):
         self.database = database
@@ -453,7 +454,7 @@ class FileOperationsService:
 
         trash_directory = (
             workspace_path
-            / ".applemango_trash"
+            / self.WORKSPACE_TRASH_DIRNAME
             / str(record["file_id"])
         )
         trash_path = (
@@ -603,7 +604,7 @@ class FileOperationsService:
 
         trash_directory = (
             workspace_path
-            / ".applemango_trash"
+            / self.WORKSPACE_TRASH_DIRNAME
             / str(record["file_id"])
         )
         trash_path = (
@@ -684,7 +685,10 @@ class FileOperationsService:
         except OSError:
             pass
 
-        trash_root = workspace_path / ".applemango_trash"
+        trash_root = (
+            workspace_path
+            / self.WORKSPACE_TRASH_DIRNAME
+        )
 
         try:
             trash_root.rmdir()

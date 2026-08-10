@@ -2634,6 +2634,10 @@ class ArchiveDatabase:
 
         The dictionary key is Path(relative_path).as_posix().casefold()
         and the value contains only minimal record metadata.
+
+        Only active and missing lifecycle records participate in
+        normal reconciliation. Deleted records are intentionally
+        excluded.
         """
         normalized_workspace_id = self._normalize_positive_int(
             workspace_id,
@@ -2646,11 +2650,17 @@ class ArchiveDatabase:
                 SELECT
                     id,
                     relative_path,
-                    archived_filename
+                    archived_filename,
+                    status
                 FROM files
                 WHERE workspace_id = ?
+                  AND status IN (?, ?)
                 """,
-                (normalized_workspace_id,),
+                (
+                    normalized_workspace_id,
+                    self.STATUS_ACTIVE,
+                    self.STATUS_MISSING,
+                ),
             ).fetchall()
 
         file_index = {}
@@ -2669,6 +2679,7 @@ class ArchiveDatabase:
                 "file_id": int(row["id"]),
                 "relative_path": relative_path,
                 "archived_filename": row["archived_filename"],
+                "status": str(row["status"]),
             }
 
         return file_index
