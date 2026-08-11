@@ -1628,14 +1628,1269 @@ def show_sync_workspace_screen(app):
     result_card_canvas, result_card = _create_rounded_card(app, page, radius=16)
     result_card_canvas.grid(row=1, column=0, sticky="nsew")
 
-    tk.Label(
+    detail_title_row = tk.Frame(
         result_card,
-        text="동기화 결과",
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+    )
+    detail_title_row.pack(fill="x")
+
+    tk.Label(
+        detail_title_row,
+        text="세부 동기화 항목",
         font=app._font(13, "bold"),
         fg=SYNC_TEXT_TITLE,
         bg=SYNC_CARD_BG,
         anchor="w",
-    ).pack(fill="x")
+    ).pack(side="left")
+
+    sync_detail_filter_button = tk.Canvas(
+        detail_title_row,
+        width=103,
+        height=34,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+        cursor="hand2",
+    )
+    sync_detail_filter_button.pack(side="right")
+
+    detail_card_content = tk.Frame(
+        result_card,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+    )
+    detail_card_content.pack(fill="both", expand=True, pady=(8, 4))
+
+    sync_detail_rows_per_page = 4
+    sync_detail_row_height = 38
+    sync_detail_header_height = 21
+    sync_detail_footer_height = 30
+    sync_detail_col_ratios = [1.4, 2.2, 2.4, 0.8, 3.0, 1.0]
+    sync_detail_col_headers = ["상태", "파일명", "위치", "크기", "상세", "작업"]
+    sync_detail_body_height = sync_detail_rows_per_page * sync_detail_row_height
+    sync_detail_table_min_height = (
+        sync_detail_header_height
+        + sync_detail_body_height
+        + sync_detail_footer_height
+    )
+
+    sync_detail_status_meta = {
+        "normal": {
+            "label": "정상",
+            "detail_fallback": "-",
+            "text_color": colors.SUCCESS_STRONG,
+            "detail_color": colors.SUCCESS_STRONG,
+            "icon": "normal_small.svg",
+        },
+        "registration_required": {
+            "label": "등록 필요",
+            "detail_fallback": "DMS 미등록 파일",
+            "text_color": colors.PRIMARY,
+            "detail_color": colors.PRIMARY,
+            "icon": "new_small.svg",
+        },
+        "review_required": {
+            "label": "확인 필요",
+            "detail_fallback": "NAS에서 파일을 찾을 수 없음",
+            "text_color": colors.ALERT,
+            "detail_color": colors.ALERT,
+            "icon": "alert_small.svg",
+        },
+        "error": {
+            "label": "오류",
+            "detail_fallback": "파일 정보를 읽을 수 없음",
+            "text_color": colors.FAILED_STRONG,
+            "detail_color": colors.FAILED_STRONG,
+            "icon": "error_small.svg",
+        },
+    }
+
+    sync_detail_filter_options = [
+        ("all", "모두 보기"),
+        ("registration_required", "등록 필요"),
+        ("review_required", "확인 필요"),
+        ("error", "오류"),
+    ]
+    sync_detail_filter_label_to_key = {
+        label: key
+        for key, label in sync_detail_filter_options
+    }
+
+    sync_detail_icons = {}
+    for icon_name in (
+        "normal_small.svg",
+        "new_small.svg",
+        "alert_small.svg",
+        "error_small.svg",
+        "filter.svg",
+        "expand.svg",
+        "collapse.svg",
+        "far_before.svg",
+        "before.svg",
+        "after.svg",
+        "far_after.svg",
+    ):
+        icon_path = SYNC_STATUS_ICON_DIR / icon_name
+        icon_w, icon_h = _read_svg_intrinsic_size(icon_path)
+        sync_detail_icons[icon_name] = load_svg_photo(
+            icon_path,
+            max_width=icon_w,
+            max_height=icon_h,
+        )
+
+    sync_detail_table_shell = tk.Frame(
+        detail_card_content,
+        bg=SYNC_CARD_BG,
+        highlightthickness=1,
+        highlightbackground=colors.BORDER,
+        highlightcolor=colors.BORDER,
+        bd=0,
+        height=sync_detail_table_min_height,
+    )
+    sync_detail_table_shell.pack(fill="both", expand=True, anchor="n")
+    sync_detail_table_shell.pack_propagate(False)
+
+    sync_detail_header_frame = tk.Frame(
+        sync_detail_table_shell,
+        bg=colors.SURFACE_ACCENT_SOFT,
+        highlightthickness=0,
+        bd=0,
+        height=sync_detail_header_height,
+    )
+    sync_detail_header_frame.pack(side="top", fill="x")
+    sync_detail_header_frame.pack_propagate(False)
+    sync_detail_header_frame.grid_propagate(False)
+
+    sync_detail_body_frame = tk.Frame(
+        sync_detail_table_shell,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+        height=sync_detail_body_height,
+    )
+    sync_detail_body_frame.pack(side="top", fill="x")
+    sync_detail_body_frame.pack_propagate(False)
+
+    sync_detail_footer_frame = tk.Frame(
+        sync_detail_table_shell,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+        height=sync_detail_footer_height,
+    )
+    sync_detail_footer_frame.pack(side="top", fill="x")
+    sync_detail_footer_frame.pack_propagate(False)
+
+    sync_detail_state = {
+        "items": [],
+        "filter_key": "all",
+        "page_index": 0,
+        "rows_per_page": sync_detail_rows_per_page,
+        "filter_popup": None,
+        "filter_popup_open": False,
+        "filter_hovered": False,
+        "filter_display_label": "모두 보기",
+        "action_states": {},
+        "action_jobs": {},
+        "refresh_job": None,
+    }
+
+    def _get_demo_sync_detail_items():
+        return [
+            {
+                "item_id": "r001",
+                "status": "registration_required",
+                "filename": "invoice_023.pdf",
+                "relative_path": "/2024/회계/invoice_023.pdf",
+                "size_bytes": 2411724,
+                "detail": "DMS 미등록 파일",
+                "record_id": None,
+            },
+            {
+                "item_id": "r002",
+                "status": "registration_required",
+                "filename": "2026_상반기_재무보고서.pdf",
+                "relative_path": "/재무/보고서/2026/2026_상반기_재무보고서.pdf",
+                "size_bytes": 19608371,
+                "detail": "DMS 미등록 파일",
+                "record_id": None,
+            },
+            {
+                "item_id": "r003",
+                "status": "registration_required",
+                "filename": "ultra_long_vendor_invoice_bundle_reference_2026_revision_candidate_final_signed_copy.pdf",
+                "relative_path": "/재무/정산/2026/Q3/보관/원본/ultra_long_vendor_invoice_bundle_reference_2026_revision_candidate_final_signed_copy.pdf",
+                "size_bytes": 45312789,
+                "detail": "DMS 미등록 파일",
+                "record_id": None,
+            },
+            {
+                "item_id": "r004",
+                "status": "review_required",
+                "filename": "contract.pdf",
+                "relative_path": "/계약/contract.pdf",
+                "size_bytes": 35651584,
+                "detail": "등록된 경로에서 파일을 찾을 수 없음",
+                "record_id": 821,
+            },
+            {
+                "item_id": "r005",
+                "status": "review_required",
+                "filename": "거래처_목록.xlsx",
+                "relative_path": "/영업/거래처/거래처_목록.xlsx",
+                "size_bytes": 962560,
+                "detail": "등록된 상위 폴더가 NAS에 존재하지 않음",
+                "record_id": 944,
+            },
+            {
+                "item_id": "r006",
+                "status": "review_required",
+                "filename": "archive_policy_v2.docx",
+                "relative_path": "/정책/archive_policy_v2.docx",
+                "size_bytes": 2288654,
+                "detail": "전체 검사 후 NAS 파일 미확인",
+                "record_id": 1408,
+            },
+            {
+                "item_id": "r007",
+                "status": "review_required",
+                "filename": "project_plan_ko_en_mix_장기전략문서_최종검토본.pptx",
+                "relative_path": "/전략/중장기/2026/회의자료/project_plan_ko_en_mix_장기전략문서_최종검토본.pptx",
+                "size_bytes": 46860972,
+                "detail": "DB 기록만 존재하고 NAS 파일은 확인되지 않음",
+                "record_id": 1454,
+            },
+            {
+                "item_id": "r008",
+                "status": "review_required",
+                "filename": "deleted_on_nas_but_in_db.txt",
+                "relative_path": "/운영/로그/deleted_on_nas_but_in_db.txt",
+                "size_bytes": 212992,
+                "detail": "등록된 NAS 경로가 존재하지 않음",
+                "record_id": 1601,
+            },
+            {
+                "item_id": "r009",
+                "status": "error",
+                "filename": "permission_denied_budget.xlsx",
+                "relative_path": "/재무/기밀/permission_denied_budget.xlsx",
+                "size_bytes": 7144823,
+                "detail": "파일 접근 권한 없음",
+                "record_id": None,
+            },
+            {
+                "item_id": "r010",
+                "status": "error",
+                "filename": "unreadable_media.mov",
+                "relative_path": "/영상/원본/unreadable_media.mov",
+                "size_bytes": 329069502,
+                "detail": "파일 정보를 읽을 수 없음",
+                "record_id": None,
+            },
+            {
+                "item_id": "r011",
+                "status": "error",
+                "filename": "broken_record.docx",
+                "relative_path": "/문서/broken_record.docx",
+                "size_bytes": 1468006,
+                "detail": "잘못된 파일 경로",
+                "record_id": None,
+            },
+            {
+                "item_id": "r012",
+                "status": "error",
+                "filename": "path_mismatch_문서.txt",
+                "relative_path": "/문서/path_mismatch_문서.txt",
+                "size_bytes": 121944,
+                "detail": "워크스페이스 경로 불일치",
+                "record_id": 1520,
+            },
+            {
+                "item_id": "r013",
+                "status": "error",
+                "filename": "duplicate_contract_pointer.pdf",
+                "relative_path": "/계약/중복/duplicate_contract_pointer.pdf",
+                "size_bytes": 1042048,
+                "detail": "중복된 DMS 경로 기록",
+                "record_id": 1201,
+            },
+        ]
+
+    sync_detail_state["items"] = _get_demo_sync_detail_items()
+
+    def _format_sync_detail_file_size(size_bytes):
+        if size_bytes is None:
+            return "-"
+
+        try:
+            size_value = float(size_bytes)
+        except (TypeError, ValueError):
+            return "-"
+
+        units = ("B", "KB", "MB", "GB", "TB")
+        unit_index = 0
+
+        while size_value >= 1024.0 and unit_index < len(units) - 1:
+            size_value /= 1024.0
+            unit_index += 1
+
+        if unit_index == 0:
+            return f"{int(size_value)} {units[unit_index]}"
+        if size_value >= 100:
+            return f"{size_value:.0f} {units[unit_index]}"
+        if size_value >= 10:
+            return f"{size_value:.1f} {units[unit_index]}"
+        return f"{size_value:.2f} {units[unit_index]}"
+
+    def _truncate_sync_detail_text(text, max_width_px, font_spec):
+        value = str(text or "")
+        if max_width_px <= 0 or not value:
+            return ""
+
+        font_obj = tkfont.Font(root=app.root, font=font_spec)
+        if font_obj.measure(value) <= max_width_px:
+            return value
+
+        ellipsis = "…"
+        ellipsis_width = font_obj.measure(ellipsis)
+        if ellipsis_width >= max_width_px:
+            return ""
+
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            candidate = value[:mid].rstrip() + ellipsis
+            if font_obj.measure(candidate) <= max_width_px:
+                lo = mid
+            else:
+                hi = mid - 1
+
+        return value[:lo].rstrip() + ellipsis
+
+    def _get_sync_detail_column_widths(total_width):
+        width = max(780, int(total_width))
+        ratio_total = sum(sync_detail_col_ratios) or 1
+        col_widths = [
+            int(width * (ratio / ratio_total))
+            for ratio in sync_detail_col_ratios
+        ]
+        col_widths[-1] += max(0, width - sum(col_widths))
+        return col_widths
+
+    def _get_sync_detail_table_metrics():
+        table_height = int(sync_detail_table_shell.winfo_height())
+        if table_height <= 1:
+            table_height = int(sync_detail_table_min_height)
+
+        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
+        header_height = max(18, int(sync_detail_header_height))
+        row_height = max(24, int(sync_detail_row_height))
+        body_height = row_height * rows_per_page
+        footer_height = int(table_height - header_height - body_height)
+
+        if footer_height < 12:
+            needed = 12 - footer_height
+            header_reducible = max(0, header_height - 18)
+            take = min(needed, header_reducible)
+            header_height -= take
+            needed -= take
+
+            if needed > 0:
+                shrink_rows = int((needed + rows_per_page - 1) // rows_per_page)
+                row_height = max(24, row_height - shrink_rows)
+                body_height = row_height * rows_per_page
+
+            footer_height = max(12, int(table_height - header_height - body_height))
+
+        return {
+            "table_height": max(1, int(table_height)),
+            "header_height": max(1, int(header_height)),
+            "row_height": max(1, int(row_height)),
+            "body_height": max(1, int(body_height)),
+            "footer_height": max(1, int(footer_height)),
+        }
+
+    def _configure_sync_detail_columns(frame, col_widths):
+        frame.grid_rowconfigure(0, weight=1)
+        for idx, col_width in enumerate(col_widths):
+            frame.grid_columnconfigure(
+                idx,
+                minsize=max(40, int(col_width)),
+                weight=0,
+            )
+
+    def _draw_sync_detail_column_separators(parent, col_widths, height_px):
+        # Card No.3 refinement: hide vertical column demarcation lines.
+        return
+
+        for child in parent.place_slaves():
+            if getattr(child, "_sync_detail_col_sep", False):
+                child.destroy()
+
+        x_cursor = 0
+        draw_height = max(1, int(height_px))
+
+        for col_width in col_widths[:-1]:
+            x_cursor += int(col_width)
+            separator = tk.Frame(
+                parent,
+                bg=colors.BORDER,
+                highlightthickness=0,
+                bd=0,
+            )
+            separator._sync_detail_col_sep = True
+            separator.place(
+                x=max(0, x_cursor),
+                y=0,
+                width=1,
+                height=draw_height,
+            )
+
+    def _get_sync_detail_status_meta(status_key):
+        return sync_detail_status_meta.get(
+            status_key,
+            sync_detail_status_meta["error"],
+        )
+
+    def _apply_sync_detail_filter(items):
+        filter_key = str(sync_detail_state.get("filter_key") or "all")
+        if filter_key == "all":
+            return list(items)
+
+        return [
+            item
+            for item in items
+            if str(item.get("status")) == filter_key
+        ]
+
+    def _get_sync_detail_page_count(filtered_items):
+        total_count = len(filtered_items)
+        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
+        return max(1, (total_count + rows_per_page - 1) // rows_per_page)
+
+    def _clamp_sync_detail_page(filtered_items):
+        page_count = _get_sync_detail_page_count(filtered_items)
+        sync_detail_state["page_index"] = max(
+            0,
+            min(
+                int(sync_detail_state["page_index"]),
+                page_count - 1,
+            ),
+        )
+
+    def _get_sync_detail_page_items(filtered_items):
+        _clamp_sync_detail_page(filtered_items)
+        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
+        start_index = int(sync_detail_state["page_index"]) * rows_per_page
+        end_index = start_index + rows_per_page
+        return filtered_items[start_index:end_index]
+
+    def _is_sync_detail_widget_alive(widget):
+        try:
+            return bool(widget.winfo_exists())
+        except Exception:
+            return False
+
+    def _is_sync_detail_descendant(widget, ancestor):
+        current = widget
+        while current is not None:
+            if current == ancestor:
+                return True
+            try:
+                current = current.master
+            except Exception:
+                return False
+        return False
+
+    def _draw_sync_detail_filter_button():
+        if not _is_sync_detail_widget_alive(sync_detail_filter_button):
+            return
+
+        try:
+            sync_detail_filter_button.delete("all")
+        except Exception:
+            return
+
+        button_width = max(88, int(sync_detail_filter_button.winfo_width()))
+        button_height = max(30, int(sync_detail_filter_button.winfo_height()))
+
+        fill_color = colors.SURFACE_HOVER if sync_detail_state.get("filter_hovered") else colors.SURFACE_ALT
+        border_color = colors.BORDER
+
+        app._smooth_rounded_rect(
+            sync_detail_filter_button,
+            1,
+            1,
+            button_width - 1,
+            button_height - 1,
+            11,
+            fill=fill_color,
+            outline=border_color,
+            width=1,
+        )
+
+        filter_icon = sync_detail_icons.get("filter.svg")
+        if filter_icon is not None:
+            sync_detail_filter_button.create_image(
+                16,
+                button_height / 2.0,
+                image=filter_icon,
+                anchor="center",
+            )
+
+        sync_detail_filter_button.create_text(
+            30,
+            button_height / 2.0,
+            text=str(sync_detail_state.get("filter_display_label") or "모두 보기"),
+            fill=SYNC_TEXT_TITLE,
+            font=app._font(10, "bold"),
+            anchor="w",
+        )
+
+        expand_icon_key = "collapse.svg" if sync_detail_state.get("filter_popup_open") else "expand.svg"
+        expand_icon = sync_detail_icons.get(expand_icon_key)
+
+        if expand_icon is not None:
+            sync_detail_filter_button.create_image(
+                button_width - 16,
+                button_height / 2.0,
+                image=expand_icon,
+                anchor="center",
+            )
+
+    def _close_sync_detail_filter_popup(*, redraw=True):
+        popup = sync_detail_state.get("filter_popup")
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+
+        sync_detail_state["filter_popup"] = None
+        sync_detail_state["filter_popup_open"] = False
+        if redraw:
+            _draw_sync_detail_filter_button()
+
+    def _set_sync_detail_filter(filter_key):
+        sync_detail_state["filter_key"] = str(filter_key)
+        sync_detail_state["filter_display_label"] = next(
+            (
+                label
+                for key, label in sync_detail_filter_options
+                if key == filter_key
+            ),
+            "모두 보기",
+        )
+        sync_detail_state["page_index"] = 0
+        _close_sync_detail_filter_popup()
+        _refresh_sync_detail_view()
+
+    def _open_sync_detail_filter_popup():
+        if not _is_sync_detail_widget_alive(sync_detail_filter_button):
+            return
+
+        _close_sync_detail_filter_popup()
+
+        popup_width = max(120, int(sync_detail_filter_button.winfo_width()))
+        popup_rows = len(sync_detail_filter_options)
+        option_row_height = 32
+        popup_height = (popup_rows * option_row_height) + 12
+        popup_x = sync_detail_filter_button.winfo_rootx()
+        popup_y = sync_detail_filter_button.winfo_rooty() + sync_detail_filter_button.winfo_height() + 2
+
+        popup = tk.Toplevel(app.root)
+        popup.overrideredirect(True)
+        popup.transient(app.root)
+        popup.configure(bg=colors.SURFACE_ALT)
+        popup.geometry(f"{popup_width}x{popup_height}+{popup_x}+{popup_y}")
+        popup.lift()
+        popup.focus_force()
+
+        shell_canvas = tk.Canvas(
+            popup,
+            bg=colors.SURFACE_ALT,
+            highlightthickness=0,
+            bd=0,
+        )
+        shell_canvas.pack(fill="both", expand=True)
+
+        def _draw_popup_shell(width_value, height_value):
+            shell_canvas.delete("popup_shell_bg")
+            app._smooth_rounded_rect(
+                shell_canvas,
+                1,
+                1,
+                max(2, int(width_value) - 1),
+                max(2, int(height_value) - 1),
+                10,
+                fill=colors.SURFACE_ALT,
+                outline=colors.BORDER,
+                width=1,
+                tags="popup_shell_bg",
+            )
+            shell_canvas.tag_lower("popup_shell_bg")
+
+        _draw_popup_shell(popup_width, popup_height)
+
+        shell_canvas.bind(
+            "<Configure>",
+            lambda event: _draw_popup_shell(event.width, event.height),
+            add="+",
+        )
+
+        body = tk.Frame(
+            shell_canvas,
+            bg=colors.SURFACE_ALT,
+            bd=0,
+            highlightthickness=0,
+        )
+
+        shell_canvas.create_window(
+            2,
+            2,
+            anchor="nw",
+            window=body,
+            width=max(1, popup_width - 4),
+            height=max(1, popup_height - 4),
+        )
+
+        current_key = str(sync_detail_state.get("filter_key") or "all")
+
+        def _build_option_row(option_key, option_label):
+            row_shell = tk.Frame(
+                body,
+                bg=colors.SURFACE_ALT,
+                bd=0,
+                highlightthickness=0,
+                height=option_row_height,
+            )
+            row_shell.pack(fill="x")
+            row_shell.pack_propagate(False)
+
+            is_current = option_key == current_key
+            row_bg = colors.SURFACE_HOVER_SOFT if is_current else colors.SURFACE_ALT
+            row_text_color = colors.PRIMARY if is_current else SYNC_TEXT_TITLE
+
+            row_label = tk.Label(
+                row_shell,
+                text=option_label,
+                font=app._font(10, "bold") if is_current else app._font(10),
+                fg=row_text_color,
+                bg=row_bg,
+                anchor="w",
+                justify="left",
+                padx=10,
+            )
+            row_label.pack(fill="both", expand=True)
+
+            def _apply_row_bg(bg_color):
+                try:
+                    row_shell.configure(bg=bg_color)
+                except Exception:
+                    pass
+                try:
+                    row_label.configure(bg=bg_color)
+                except Exception:
+                    pass
+
+            def _on_row_enter(_event=None):
+                _apply_row_bg(colors.SURFACE_HOVER_SOFT)
+
+            def _on_row_leave(_event=None):
+                _apply_row_bg(row_bg)
+
+            def _on_row_click(_event=None):
+                _set_sync_detail_filter(option_key)
+                return "break"
+
+            for widget in (row_shell, row_label):
+                widget.bind("<Enter>", _on_row_enter, add="+")
+                widget.bind("<Leave>", _on_row_leave, add="+")
+                widget.bind("<Button-1>", _on_row_click, add="+")
+
+        for option_key, option_label in sync_detail_filter_options:
+            _build_option_row(option_key, option_label)
+
+        popup.bind("<Escape>", lambda _event: _close_sync_detail_filter_popup())
+
+        sync_detail_state["filter_popup"] = popup
+        sync_detail_state["filter_popup_open"] = True
+        _draw_sync_detail_filter_button()
+
+    def _toggle_sync_detail_filter_popup(_event=None):
+        if sync_detail_state.get("filter_popup_open"):
+            _close_sync_detail_filter_popup()
+        else:
+            _open_sync_detail_filter_popup()
+        return "break"
+
+    def _build_sync_detail_action_button(parent, item_id):
+        button_canvas = tk.Canvas(
+            parent,
+            width=74,
+            height=30,
+            bg=parent.cget("bg"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+
+        button_state = {"hovered": False}
+
+        def _draw_button(hovered=False):
+            button_canvas.delete("all")
+
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+            is_enabled = action_state == "idle"
+
+            if action_state == "done":
+                fill_color = colors.SURFACE_HOVER
+                border_color = colors.BORDER
+                text_color = colors.SUCCESS_STRONG
+                label_text = "완료"
+            elif action_state == "registering":
+                fill_color = colors.SURFACE_HOVER
+                border_color = colors.BORDER
+                text_color = SYNC_TEXT_LABEL
+                label_text = "등록 중…"
+            else:
+                fill_color = colors.SURFACE_HOVER_SOFT if hovered else colors.SURFACE_ALT
+                border_color = colors.PRIMARY
+                text_color = colors.PRIMARY
+                label_text = "등록"
+
+            app._smooth_rounded_rect(
+                button_canvas,
+                1,
+                1,
+                73,
+                29,
+                9,
+                fill=fill_color,
+                outline=border_color,
+                width=1,
+            )
+
+            button_canvas.create_text(
+                37,
+                15,
+                text=label_text,
+                fill=text_color,
+                font=app._font(10, "bold"),
+                anchor="center",
+            )
+
+            button_canvas.configure(cursor="hand2" if is_enabled else "")
+
+        def _on_enter(_event=None):
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+            if action_state != "idle":
+                return
+            button_state["hovered"] = True
+            _draw_button(hovered=True)
+
+        def _on_leave(_event=None):
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+            if action_state != "idle":
+                return
+            button_state["hovered"] = False
+            _draw_button(hovered=False)
+
+        def _start_demo_register(_event=None):
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+            if action_state != "idle":
+                return "break"
+
+            sync_detail_state["action_states"][item_id] = "registering"
+            _refresh_sync_detail_view()
+
+            def _finish_register():
+                sync_detail_state["action_jobs"].pop(item_id, None)
+                sync_detail_state["action_states"][item_id] = "done"
+                _refresh_sync_detail_view()
+
+            job_id = app.root.after(700, _finish_register)
+            sync_detail_state["action_jobs"][item_id] = job_id
+            return "break"
+
+        button_canvas.bind("<Enter>", _on_enter, add="+")
+        button_canvas.bind("<Leave>", _on_leave, add="+")
+        button_canvas.bind("<Button-1>", _start_demo_register, add="+")
+
+        _draw_button(hovered=False)
+        return button_canvas
+
+    def _build_sync_detail_pagination_icon_button(parent, icon_name, *, enabled, command):
+        button_canvas = tk.Canvas(
+            parent,
+            width=30,
+            height=28,
+            bg=parent.cget("bg"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2" if enabled else "",
+        )
+        icon_photo = sync_detail_icons.get(icon_name)
+
+        def _draw_button():
+            button_canvas.delete("all")
+            if enabled:
+                fill_color = colors.SURFACE_ALT
+                border_color = colors.BORDER
+            else:
+                fill_color = colors.SURFACE_ALT
+                border_color = colors.SURFACE_ALT
+
+            app._smooth_rounded_rect(
+                button_canvas,
+                1,
+                1,
+                29,
+                27,
+                8,
+                fill=fill_color,
+                outline=border_color,
+                width=1,
+            )
+
+            if icon_photo is not None:
+                button_canvas.create_image(
+                    15,
+                    14,
+                    image=icon_photo,
+                    anchor="center",
+                )
+
+            button_canvas.configure(cursor="hand2" if enabled else "")
+
+        def _on_click(_event=None):
+            if not enabled:
+                return "break"
+            command()
+            return "break"
+
+        button_canvas.bind("<Button-1>", _on_click, add="+")
+
+        _draw_button()
+        return button_canvas
+
+    def _set_sync_detail_page(page_index):
+        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
+        page_count = _get_sync_detail_page_count(filtered_items)
+
+        sync_detail_state["page_index"] = max(
+            0,
+            min(int(page_index), page_count - 1),
+        )
+        _refresh_sync_detail_view()
+
+    def _render_sync_detail_header(col_widths, header_height):
+        for child in sync_detail_header_frame.winfo_children():
+            child.destroy()
+
+        _configure_sync_detail_columns(sync_detail_header_frame, col_widths)
+
+        for col_idx, header_text in enumerate(sync_detail_col_headers):
+            tk.Label(
+                sync_detail_header_frame,
+                text=header_text,
+                font=app._font(10, "bold"),
+                fg=SYNC_TEXT_TITLE,
+                bg=colors.SURFACE_ACCENT_SOFT,
+                anchor="center",
+                justify="center",
+            ).grid(
+                row=0,
+                column=col_idx,
+                sticky="nsew",
+                padx=(4, 4),
+            )
+
+        _draw_sync_detail_column_separators(
+            sync_detail_header_frame,
+            col_widths,
+            header_height,
+        )
+
+    def _render_sync_detail_rows(col_widths, row_height):
+        for child in sync_detail_body_frame.winfo_children():
+            child.destroy()
+
+        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
+        page_items = _get_sync_detail_page_items(filtered_items)
+
+        if not filtered_items:
+            empty_shell = tk.Frame(
+                sync_detail_body_frame,
+                bg=SYNC_CARD_BG,
+                highlightthickness=0,
+                bd=0,
+            )
+            empty_shell.pack(fill="both", expand=True)
+
+            tk.Label(
+                empty_shell,
+                text="확인이 필요한 동기화 항목이 없습니다.",
+                font=app._font(11, "bold"),
+                fg=SYNC_TEXT_TITLE,
+                bg=SYNC_CARD_BG,
+                anchor="center",
+                justify="center",
+            ).place(relx=0.5, rely=0.45, anchor="center")
+
+            tk.Label(
+                empty_shell,
+                text="현재 발견된 파일 불일치 또는 오류가 없습니다.",
+                font=app._font(10),
+                fg=SYNC_TEXT_LABEL,
+                bg=SYNC_CARD_BG,
+                anchor="center",
+                justify="center",
+            ).place(relx=0.5, rely=0.57, anchor="center")
+            return
+
+        row_font = app._font(10)
+        row_bold_font = app._font(10, "bold")
+
+        for row_slot in range(sync_detail_rows_per_page):
+            item = page_items[row_slot] if row_slot < len(page_items) else None
+            row_bg = colors.SURFACE_ALT
+
+            row_frame = tk.Frame(
+                sync_detail_body_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+                height=row_height,
+            )
+            row_frame.pack(fill="x")
+            row_frame.pack_propagate(False)
+            row_frame.grid_propagate(False)
+            _configure_sync_detail_columns(row_frame, col_widths)
+
+            if item is None:
+                _draw_sync_detail_column_separators(
+                    row_frame,
+                    col_widths,
+                    row_height,
+                )
+                tk.Frame(
+                    row_frame,
+                    bg=colors.BORDER,
+                    height=1,
+                    bd=0,
+                    highlightthickness=0,
+                ).place(relx=0.0, rely=1.0, relwidth=1.0, anchor="sw")
+                continue
+
+            item_id = str(item.get("item_id") or "")
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+
+            status_key = str(item.get("status") or "error")
+            if status_key == "registration_required" and action_state == "done":
+                status_key = "normal"
+
+            status_meta = _get_sync_detail_status_meta(status_key)
+            status_icon = sync_detail_icons.get(str(status_meta.get("icon") or "error.svg"))
+
+            status_cell = tk.Frame(
+                row_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            status_cell.grid(row=0, column=0, sticky="nsew")
+
+            status_group = tk.Frame(
+                status_cell,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            status_group.place(relx=0.5, rely=0.5, anchor="center")
+
+            if status_icon is not None:
+                status_icon_label = tk.Label(
+                    status_group,
+                    image=status_icon,
+                    bg=row_bg,
+                    anchor="center",
+                )
+                status_icon_label.image = status_icon
+                status_icon_label.pack(side="left")
+
+            status_label = tk.Label(
+                status_group,
+                text=str(status_meta.get("label") or "오류"),
+                font=row_bold_font,
+                fg=str(status_meta.get("text_color") or SYNC_TEXT_TITLE),
+                bg=row_bg,
+                anchor="w",
+                justify="left",
+            )
+            status_label.pack(side="left", padx=(6, 0))
+
+            filename_raw = str(item.get("filename") or "-")
+            path_raw = str(item.get("relative_path") or "-")
+            detail_raw = str(item.get("detail") or status_meta.get("detail_fallback") or "-")
+            if status_key == "normal":
+                detail_raw = "-"
+            size_text = _format_sync_detail_file_size(item.get("size_bytes"))
+
+            filename_text = _truncate_sync_detail_text(
+                filename_raw,
+                max(10, int(col_widths[1]) - 20),
+                row_bold_font,
+            )
+            path_text = _truncate_sync_detail_text(
+                path_raw,
+                max(10, int(col_widths[2]) - 20),
+                row_font,
+            )
+            detail_text = _truncate_sync_detail_text(
+                detail_raw,
+                max(10, int(col_widths[4]) - 10),
+                row_font,
+            )
+
+            filename_cell = tk.Frame(
+                row_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            filename_cell.grid(row=0, column=1, sticky="nsew")
+
+            filename_label = tk.Label(
+                filename_cell,
+                text=filename_text,
+                font=row_bold_font,
+                fg=SYNC_TEXT_VALUE,
+                bg=row_bg,
+                anchor="w",
+                justify="left",
+            )
+            filename_label.pack(side="left", padx=(10, 6), pady=(0, 0))
+
+            path_cell = tk.Frame(
+                row_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            path_cell.grid(row=0, column=2, sticky="nsew")
+
+            path_label = tk.Label(
+                path_cell,
+                text=path_text,
+                font=row_font,
+                fg=SYNC_TEXT_LABEL,
+                bg=row_bg,
+                anchor="w",
+                justify="left",
+            )
+            path_label.pack(side="left", padx=(10, 6), pady=(0, 0))
+
+            size_label = tk.Label(
+                row_frame,
+                text=size_text,
+                font=row_font,
+                fg=SYNC_TEXT_TITLE,
+                bg=row_bg,
+                anchor="center",
+                justify="center",
+            )
+            size_label.grid(row=0, column=3, sticky="nsew", padx=(4, 4))
+
+            detail_label = tk.Label(
+                row_frame,
+                text=detail_text,
+                font=row_font,
+                fg=str(status_meta.get("detail_color") or status_meta.get("text_color") or SYNC_TEXT_LABEL),
+                bg=row_bg,
+                anchor="center",
+                justify="center",
+            )
+            detail_label.grid(row=0, column=4, sticky="nsew", padx=(4, 4))
+
+            action_cell = tk.Frame(
+                row_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            action_cell.grid(row=0, column=5, sticky="nsew")
+
+            if status_key == "registration_required":
+                action_button = _build_sync_detail_action_button(
+                    action_cell,
+                    item_id,
+                )
+                action_button.place(relx=0.5, rely=0.5, anchor="center")
+            else:
+                action_dash = tk.Label(
+                    action_cell,
+                    text="—",
+                    font=app._font(11, "bold"),
+                    fg=SYNC_TEXT_LABEL,
+                    bg=row_bg,
+                    anchor="center",
+                    justify="center",
+                )
+                action_dash.place(relx=0.5, rely=0.5, anchor="center")
+
+            _draw_sync_detail_column_separators(
+                row_frame,
+                col_widths,
+                row_height,
+            )
+
+            tk.Frame(
+                row_frame,
+                bg=colors.BORDER,
+                height=1,
+                bd=0,
+                highlightthickness=0,
+            ).place(relx=0.0, rely=1.0, relwidth=1.0, anchor="sw")
+
+    def _render_sync_detail_pagination(filtered_items):
+        for child in sync_detail_footer_frame.winfo_children():
+            child.destroy()
+
+        page_count = _get_sync_detail_page_count(filtered_items)
+        current_page = int(sync_detail_state["page_index"])
+
+        pager_shell = tk.Frame(
+            sync_detail_footer_frame,
+            bg=SYNC_CARD_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        pager_shell.place(relx=0.5, rely=0.5, anchor="center")
+
+        can_go_prev = current_page > 0
+        can_go_next = current_page < (page_count - 1)
+
+        first_btn = _build_sync_detail_pagination_icon_button(
+            pager_shell,
+            "far_before.svg",
+            enabled=can_go_prev,
+            command=lambda: _set_sync_detail_page(0),
+        )
+        first_btn.pack(side="left", padx=(0, 6))
+
+        prev_btn = _build_sync_detail_pagination_icon_button(
+            pager_shell,
+            "before.svg",
+            enabled=can_go_prev,
+            command=lambda: _set_sync_detail_page(current_page - 1),
+        )
+        prev_btn.pack(side="left", padx=(0, 8))
+
+        tk.Label(
+            pager_shell,
+            text=f"{current_page + 1} / {page_count}",
+            font=app._font(12),
+            fg=SYNC_TEXT_TITLE,
+            bg=SYNC_CARD_BG,
+            anchor="center",
+            justify="center",
+        ).pack(side="left", padx=(0, 8))
+
+        next_btn = _build_sync_detail_pagination_icon_button(
+            pager_shell,
+            "after.svg",
+            enabled=can_go_next,
+            command=lambda: _set_sync_detail_page(current_page + 1),
+        )
+        next_btn.pack(side="left", padx=(0, 6))
+
+        last_btn = _build_sync_detail_pagination_icon_button(
+            pager_shell,
+            "far_after.svg",
+            enabled=can_go_next,
+            command=lambda: _set_sync_detail_page(page_count - 1),
+        )
+        last_btn.pack(side="left")
+
+    def _refresh_sync_detail_view():
+        if not _is_sync_detail_widget_alive(sync_detail_table_shell):
+            return
+
+        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
+        _clamp_sync_detail_page(filtered_items)
+
+        table_metrics = _get_sync_detail_table_metrics()
+        header_height = int(table_metrics["header_height"])
+        row_height = int(table_metrics["row_height"])
+        body_height = int(table_metrics["body_height"])
+        footer_height = int(table_metrics["footer_height"])
+
+        sync_detail_header_frame.configure(height=header_height)
+        sync_detail_body_frame.configure(height=body_height)
+        sync_detail_footer_frame.configure(height=footer_height)
+
+        available_width = max(780, int(sync_detail_table_shell.winfo_width()) - 4)
+        col_widths = _get_sync_detail_column_widths(available_width)
+
+        _draw_sync_detail_filter_button()
+        _render_sync_detail_header(col_widths, header_height)
+        _render_sync_detail_rows(col_widths, row_height)
+        _render_sync_detail_pagination(filtered_items)
+
+    def _schedule_sync_detail_refresh(_event=None):
+        refresh_job = sync_detail_state.get("refresh_job")
+        if refresh_job is not None:
+            return
+
+        def _run_refresh():
+            sync_detail_state["refresh_job"] = None
+            _refresh_sync_detail_view()
+
+        try:
+            sync_detail_state["refresh_job"] = app.root.after(16, _run_refresh)
+        except Exception:
+            sync_detail_state["refresh_job"] = None
+
+    def _on_filter_button_enter(_event=None):
+        sync_detail_state["filter_hovered"] = True
+        _draw_sync_detail_filter_button()
+
+    def _on_filter_button_leave(_event=None):
+        sync_detail_state["filter_hovered"] = False
+        _draw_sync_detail_filter_button()
+
+    def _on_detail_destroy(_event=None):
+        _close_sync_detail_filter_popup(redraw=False)
+
+        for job_id in list(sync_detail_state["action_jobs"].values()):
+            try:
+                app.root.after_cancel(job_id)
+            except Exception:
+                pass
+        sync_detail_state["action_jobs"].clear()
+
+        refresh_job = sync_detail_state.get("refresh_job")
+        if refresh_job is not None:
+            try:
+                app.root.after_cancel(refresh_job)
+            except Exception:
+                pass
+            sync_detail_state["refresh_job"] = None
+
+    sync_detail_filter_button.bind("<Configure>", lambda _event: _draw_sync_detail_filter_button(), add="+")
+    sync_detail_filter_button.bind("<Button-1>", _toggle_sync_detail_filter_popup, add="+")
+    sync_detail_filter_button.bind("<Enter>", _on_filter_button_enter, add="+")
+    sync_detail_filter_button.bind("<Leave>", _on_filter_button_leave, add="+")
+
+    sync_detail_table_shell.bind("<Configure>", _schedule_sync_detail_refresh, add="+")
+    detail_card_content.bind("<Destroy>", _on_detail_destroy, add="+")
+
+    _refresh_sync_detail_view()
 
     app.last_scan_value = None
     app.last_sync_value = None
