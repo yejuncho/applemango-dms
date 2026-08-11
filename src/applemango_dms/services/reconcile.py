@@ -30,6 +30,17 @@ class WorkspaceReconciliationService:
     MANAGED_TRASH_DIRNAME = (
         FileOperationsService.WORKSPACE_TRASH_DIRNAME
     )
+    RESERVED_DIRECTORY_NAMES = frozenset(
+        (
+            MANAGED_TRASH_DIRNAME,
+            "@eaDir",
+            "#recycle",
+        )
+    )
+    RESERVED_DIRECTORY_NAMES_CASEFOLDED = frozenset(
+        name.casefold()
+        for name in RESERVED_DIRECTORY_NAMES
+    )
     UPLOAD_STAGING_PREFIX = ".__applemango_upload_"
     UPLOAD_STAGING_SUFFIX = ".part"
 
@@ -1484,7 +1495,7 @@ class WorkspaceReconciliationService:
 
         return (
             normalized_name
-            == cls.MANAGED_TRASH_DIRNAME.casefold()
+            in cls.RESERVED_DIRECTORY_NAMES_CASEFOLDED
         )
 
     @classmethod

@@ -217,6 +217,10 @@ class ArchiveDatabase:
                 conn
             )
 
+            self._migrate_files_relative_path_uniqueness(
+                conn
+            )
+
             self._create_indexes(conn)
             conn.commit()
 
@@ -318,8 +322,6 @@ class ArchiveDatabase:
                 deleted_at TEXT,
 
                 {archived_filename_unique_sql}
-                UNIQUE (workspace_id, relative_path),
-
                 FOREIGN KEY (workspace_id)
                     REFERENCES workspaces(id)
                     ON UPDATE CASCADE
@@ -420,6 +422,78 @@ class ArchiveDatabase:
         """
         if not self._files_has_archived_filename_uniqueness(conn):
             return False
+
+        self._rebuild_files_table_preserving_rows(conn)
+        return True
+
+    def _files_has_legacy_relative_path_uniqueness(
+        self,
+        conn,
+    ):
+        index_rows = conn.execute(
+            """
+            PRAGMA index_list(files);
+            """
+        ).fetchall()
+
+        for index_row in index_rows:
+            if int(index_row["unique"]) != 1:
+                continue
+
+            if int(index_row["partial"]) == 1:
+                continue
+
+            origin = str(index_row["origin"] or "").strip().lower()
+            if origin not in {"u", "c"}:
+                continue
+
+            index_name = str(index_row["name"] or "")
+            if not index_name:
+                continue
+
+            index_info = conn.execute(
+                f"""
+                PRAGMA index_info({index_name});
+                """
+            ).fetchall()
+
+            ordered_columns = [
+                str(info_row["name"] or "")
+                for info_row in sorted(
+                    index_info,
+                    key=lambda row: int(row["seqno"]),
+                )
+            ]
+
+            if ordered_columns == [
+                "workspace_id",
+                "relative_path",
+            ]:
+                return True
+
+        return False
+
+    def _migrate_files_relative_path_uniqueness(
+        self,
+        conn,
+    ):
+        """
+        Rebuild files table when legacy unconditional uniqueness
+        on (workspace_id, relative_path) still exists.
+
+        The new partial unique index for live records is excluded
+        from this detection and must not retrigger migration.
+        """
+        if not self._files_has_legacy_relative_path_uniqueness(conn):
+            return False
+
+        self._rebuild_files_table_preserving_rows(conn)
+        return True
+
+    def _rebuild_files_table_preserving_rows(
+        self,
+        conn,
+    ):
 
         files_row_count_before = int(
             conn.execute(
@@ -681,6 +755,15 @@ class ArchiveDatabase:
             )
 
     def _create_indexes(self, conn):
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                ux_files_workspace_live_relative_path
+            ON files(workspace_id, relative_path)
+            WHERE status IN ('active', 'missing');
+            """
+        )
+
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_files_workspace_status
@@ -3143,9 +3226,9 @@ class ArchiveDatabase:
 
                 WHERE f.workspace_id = ?
                   AND f.id = ?
-                  AND f.status IN (
-                      {status_placeholders}
-                  )
+                                    AND f.status IN (
+                                            {status_placeholders}
+                                    )
 
                 LIMIT 1
                 """,
@@ -3244,7 +3327,7 @@ class ArchiveDatabase:
                 """
                 SELECT
                     uploaded_by,
-                    status
+                                        status
                 FROM files
                 WHERE workspace_id = ?
                   AND id = ?
@@ -3352,7 +3435,8 @@ class ArchiveDatabase:
                 """
                 SELECT
                     uploaded_by,
-                    status
+                                        status,
+                                        relative_path
                 FROM files
                 WHERE workspace_id = ?
                   AND id = ?
@@ -3386,23 +3470,54 @@ class ArchiveDatabase:
                     "this file."
                 )
 
-            cursor = conn.execute(
+            collision = conn.execute(
                 """
-                UPDATE files
-                SET
-                    status = ?,
-                    deleted_at = NULL
+                SELECT id
+                FROM files
                 WHERE workspace_id = ?
-                  AND id = ?
-                  AND status = ?
+                  AND id != ?
+                  AND relative_path = ?
+                  AND status IN (?, ?)
+                LIMIT 1
                 """,
                 (
-                    self.STATUS_ACTIVE,
                     normalized_workspace_id,
                     normalized_file_id,
-                    self.STATUS_DELETED,
+                    str(row["relative_path"] or "").strip(),
+                    self.STATUS_ACTIVE,
+                    self.STATUS_MISSING,
                 ),
-            )
+            ).fetchone()
+
+            if collision is not None:
+                raise FileExistsError(
+                    "Another live database record already "
+                    "uses the requested path."
+                )
+
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE files
+                    SET
+                        status = ?,
+                        deleted_at = NULL
+                    WHERE workspace_id = ?
+                      AND id = ?
+                      AND status = ?
+                    """,
+                    (
+                        self.STATUS_ACTIVE,
+                        normalized_workspace_id,
+                        normalized_file_id,
+                        self.STATUS_DELETED,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise FileExistsError(
+                    "Another live database record already "
+                    "uses the requested path."
+                ) from exc
 
             if cursor.rowcount != 1:
                 raise RuntimeError(
@@ -3538,18 +3653,21 @@ class ArchiveDatabase:
                 WHERE workspace_id = ?
                   AND id != ?
                   AND relative_path = ?
+                  AND status IN (?, ?)
                 LIMIT 1
                 """,
                 (
                     normalized_workspace_id,
                     normalized_file_id,
                     normalized_relative_path,
+                    self.STATUS_ACTIVE,
+                    self.STATUS_MISSING,
                 ),
             ).fetchone()
 
             if collision is not None:
                 raise FileExistsError(
-                    "Another database record already uses "
+                    "Another live database record already uses "
                     "the requested path."
                 )
 
@@ -4921,7 +5039,7 @@ class ArchiveDatabase:
                 file_id: int
                 relative_path: str
 
-        An existing path is treated as an idempotent no-op.
+        An existing live path is treated as an idempotent no-op.
         """
         normalized_workspace_id = (
             self._normalize_positive_int(
@@ -5016,11 +5134,14 @@ class ArchiveDatabase:
                 FROM files
                 WHERE workspace_id = ?
                   AND relative_path = ?
+                                    AND status IN (?, ?)
                 LIMIT 1
                 """,
                 (
                     normalized_workspace_id,
                     relative_path,
+                                        self.STATUS_ACTIVE,
+                                        self.STATUS_MISSING,
                 ),
             ).fetchone()
 
@@ -5071,11 +5192,14 @@ class ArchiveDatabase:
                     FROM files
                     WHERE workspace_id = ?
                       AND relative_path = ?
+                                            AND status IN (?, ?)
                     LIMIT 1
                     """,
                     (
                         normalized_workspace_id,
                         relative_path,
+                                                self.STATUS_ACTIVE,
+                                                self.STATUS_MISSING,
                     ),
                 ).fetchone()
 
