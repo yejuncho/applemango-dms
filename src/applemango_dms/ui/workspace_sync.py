@@ -1,5 +1,7 @@
 import tkinter as tk
 import tkinter.font as tkfont
+import threading
+import queue
 from datetime import datetime
 from pathlib import Path
 import re
@@ -8,7 +10,7 @@ import applemango_dms.config as config
 import applemango_dms.state as state
 from applemango_dms.ui import colors
 from applemango_dms.ui.workplace_menu import render_workspace_sidebar_nav
-from applemango_dms.services.workspace_stats import collect_workspace_filesystem_stats
+from applemango_dms.services.reconcile import WorkspaceReconciliationService
 from applemango_dms.utils.images import load_svg_photo
 
 SYNC_PAGE_BG = colors.SURFACE_ALT
@@ -54,15 +56,12 @@ SYNC_STATUS_ICON_DIR = (
     / "workplace_sync"
 )
 
-# Card No. 2 demo-mode safety switch. This patch intentionally avoids
-# NAS access and SQLite reconciliation writes while polishing UI/UX.
-SYNC_UI_DEMO_MODE = True
-
 SYNC_CARD_STATE_INITIAL = "initial"
 SYNC_CARD_STATE_SCANNING = "scanning"
 SYNC_CARD_STATE_RESULT = "result"
 SYNC_CARD_STATE_SYNCING = "syncing"
 SYNC_CARD_STATE_COMPLETE = "complete"
+SYNC_CARD_STATE_FAILED = "failed"
 
 SYNC_WORKFLOW_PRIMARY = "#3447AA"
 SYNC_WORKFLOW_PRIMARY_HOVER = getattr(colors, "PRIMARY_HOVER", "#2d3f98")
@@ -72,23 +71,12 @@ SYNC_SUMMARY_COLOR_NEW = colors.PRIMARY
 SYNC_SUMMARY_COLOR_ALERT = colors.ALERT
 SYNC_SUMMARY_COLOR_ERROR = colors.FAILED_STRONG
 
-SYNC_DEMO_SCAN_TOTAL_FILES = 18442
-SYNC_DEMO_SCAN_TICK_MS = 110
-SYNC_DEMO_SYNC_TICK_MS = 110
-
-SYNC_DEMO_SUMMARY_AFTER_SCAN = {
-    "normal": 18421,
-    "registration_required": 15,
-    "review_required": 4,
-    "error": 2,
-}
-
-SYNC_DEMO_SUMMARY_AFTER_SYNC = {
-    "normal": 18436,
-    "registration_required": 0,
-    "review_required": 4,
-    "error": 2,
-}
+SYNC_DETAIL_STATE_NOT_SCANNED = "not_scanned"
+SYNC_DETAIL_STATE_SCANNING = "scanning"
+SYNC_DETAIL_STATE_SYNCING = "syncing"
+SYNC_DETAIL_STATE_FILTER_EMPTY = "filter_empty"
+SYNC_DETAIL_STATE_SCANNED_EMPTY = "scanned_empty"
+SYNC_DETAIL_STATE_ITEMS = "items"
 
 
 def _parse_svg_dimension(raw_text):
@@ -231,56 +219,51 @@ def _resolve_workspace_context(app):
     return workspace_id, workspace_name, share_path
 
 
-def _collect_sync_status_snapshot(app):
+def _build_initial_sync_status_snapshot(app):
     workspace_id, workspace_name, share_path = _resolve_workspace_context(app)
 
-    db_file_count = None
-    if getattr(app, "db", None) is not None and workspace_id is not None:
-        try:
-            db_file_count = app.db.count_files_by_workspace(workspace_id)
-        except Exception:
-            db_file_count = None
-
-    nas_file_count = None
-    if share_path:
-        try:
-            stats = collect_workspace_filesystem_stats(Path(str(share_path)))
-            nas_file_count = int(stats.get("fs_file_count", 0))
-        except Exception:
-            nas_file_count = None
-
-    last_check_raw = getattr(app, "sync_last_check_at", None)
+    last_check_raw = None
+    last_sync_raw = None
 
     if (
-        not last_check_raw
-        and getattr(app, "db", None) is not None
+        getattr(app, "db", None) is not None
         and workspace_id is not None
-        and callable(getattr(app.db, "get_workspace_last_check_timestamp", None))
+        and callable(getattr(app.db, "get_workspace_reconciliation_state", None))
     ):
         try:
-            last_check_raw = app.db.get_workspace_last_check_timestamp(workspace_id)
+            persisted_state = app.db.get_workspace_reconciliation_state(workspace_id)
+            if isinstance(persisted_state, dict):
+                last_check_raw = persisted_state.get("last_check_at")
+                last_sync_raw = persisted_state.get("last_sync_at")
         except Exception:
             last_check_raw = None
+            last_sync_raw = None
 
-    last_sync_raw = getattr(app, "sync_last_sync_at", None)
+    if not last_check_raw:
+        last_check_raw = getattr(app, "sync_last_check_at", None)
 
-    is_synced = (
-        nas_file_count is not None
-        and db_file_count is not None
-        and int(nas_file_count) == int(db_file_count)
-    )
-
-    if is_synced and not last_sync_raw:
-        last_sync_raw = last_check_raw
+    if not last_sync_raw:
+        last_sync_raw = getattr(app, "sync_last_sync_at", None)
 
     return {
+        "workspace_id": workspace_id,
+        "workspace_root": str(share_path) if share_path else None,
         "workspace_name": workspace_name or "-",
-        "status_key": "sync_pass" if is_synced else "sync_alert",
-        "status_text": "정상" if is_synced else "확인 필요",
-        "last_check_text": _format_sync_timestamp(last_check_raw),
-        "last_sync_text": _format_sync_timestamp(last_sync_raw),
-        "nas_files_text": _format_sync_count(nas_file_count, fallback="접근 불가"),
-        "db_files_text": _format_sync_count(db_file_count),
+        "status_key": "sync_alert",
+        "status_text": "검사 필요",
+        "last_check_at": last_check_raw,
+        "last_sync_at": last_sync_raw,
+        "nas_file_count": None,
+        "db_file_count": None,
+        "summary": {
+            "normal": 0,
+            "registration_required": 0,
+            "review_required": 0,
+            "error": 0,
+        },
+        "detail_items": [],
+        "has_scanned": False,
+        "is_synced": False,
     }
 
 
@@ -332,8 +315,9 @@ def _create_workspace_status_cell(
     return cell
 
 
-def _build_workspace_status_grid(app, parent):
-    snapshot = _collect_sync_status_snapshot(app)
+def _build_workspace_status_grid(app, parent, snapshot):
+    for child in parent.winfo_children():
+        child.destroy()
 
     icon_names = {
         "workspace": "workspace.svg",
@@ -388,28 +372,28 @@ def _build_workspace_status_grid(app, parent):
         (
             "last_check",
             "마지막 검사",
-            snapshot["last_check_text"],
+            _format_sync_timestamp(snapshot.get("last_check_at")),
             SYNC_TEXT_TITLE,
             colors.PRIMARY,
         ),
         (
             "last_sync",
             "마지막 동기화",
-            snapshot["last_sync_text"],
+            _format_sync_timestamp(snapshot.get("last_sync_at")),
             SYNC_TEXT_TITLE,
             colors.PRIMARY,
         ),
         (
             "nas_files",
             "NAS 파일 수",
-            snapshot["nas_files_text"],
+            _format_sync_count(snapshot.get("nas_file_count")),
             SYNC_TEXT_TITLE,
             SYNC_TEXT_TITLE,
         ),
         (
             "db_files",
             "DMS 파일 수",
-            snapshot["db_files_text"],
+            _format_sync_count(snapshot.get("db_file_count")),
             SYNC_TEXT_TITLE,
             SYNC_TEXT_TITLE,
         ),
@@ -900,7 +884,13 @@ def show_sync_workspace_screen(app):
         anchor="w",
     ).pack(fill="x")
 
-    _build_workspace_status_grid(app, left_card)
+    left_card_status_host = tk.Frame(
+        left_card,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+    )
+    left_card_status_host.pack(fill="both", expand=True)
 
     tk.Label(
         right_card,
@@ -926,7 +916,6 @@ def show_sync_workspace_screen(app):
         "error": "error.svg",
     }
     summary_icons = {}
-
     for key, filename in summary_icon_map.items():
         icon_path = SYNC_STATUS_ICON_DIR / filename
         icon_w, icon_h = _read_svg_intrinsic_size(icon_path)
@@ -936,7 +925,6 @@ def show_sync_workspace_screen(app):
             max_height=icon_h,
         )
 
-    question_mark_icon = None
     question_mark_icon_path = SYNC_STATUS_ICON_DIR / "question_mark.svg"
     question_icon_w, question_icon_h = _read_svg_intrinsic_size(question_mark_icon_path)
     question_mark_icon = load_svg_photo(
@@ -946,14 +934,8 @@ def show_sync_workspace_screen(app):
     )
 
     sync_card_tall_height = int(top_cards_height)
-    sync_card_middle_height = max(
-        1,
-        int(round(sync_card_tall_height * 0.75)),
-    )
-    sync_card_short_height = max(
-        1,
-        int(round(sync_card_tall_height * 0.60)),
-    )
+    sync_card_middle_height = max(1, int(round(sync_card_tall_height * 0.75)))
+    sync_card_short_height = max(1, int(round(sync_card_tall_height * 0.60)))
 
     sync_action_button_width = 320
     sync_action_button_side_pad = 28
@@ -967,20 +949,238 @@ def show_sync_workspace_screen(app):
         "anim_start_time": 0,
         "anim_duration_ms": 220,
     }
-
     right_card_canvas.configure(height=sync_card_middle_height)
 
-    sync_demo = {
-        "state": None,
-        "summary": dict(SYNC_DEMO_SUMMARY_AFTER_SCAN),
+    initial_snapshot = _build_initial_sync_status_snapshot(app)
+
+    service = None
+    service_init_error = None
+    if getattr(app, "db", None) is not None:
+        try:
+            service = WorkspaceReconciliationService(app.db)
+        except Exception as exc:
+            service_init_error = f"{type(exc).__name__}: {exc}"
+
+    runtime = {
+        "phase": "initial",
+        "workspace_id": initial_snapshot.get("workspace_id"),
+        "workspace_root": initial_snapshot.get("workspace_root"),
+        "workspace_name": initial_snapshot.get("workspace_name") or "-",
+        "latest_snapshot": dict(initial_snapshot),
+        "latest_workflow": None,
+        "latest_scan_report": None,
+        "latest_scan_completed_at": initial_snapshot.get("last_check_at"),
+        "last_sync_at": initial_snapshot.get("last_sync_at"),
+        "has_scanned": False,
+        "busy": False,
+        "operation": None,
+        "operation_generation": 0,
+        "destroyed": False,
+        "service": service,
+        "service_init_error": service_init_error,
         "processed": 0,
         "total": 0,
         "message": "",
-        "job": None,
-        "loading_job": None,
-        "loading_dot_count": 1,
-        "loading_base_text": "",
+        "failure_message": "",
+        "last_apply_inserted_count": 0,
+        "last_apply_failed_count": 0,
+        "worker_events": queue.Queue(),
+        "worker_poll_job": None,
     }
+
+    sync_card_state = {
+        "state": SYNC_CARD_STATE_INITIAL,
+        "summary": dict(initial_snapshot.get("summary") or {}),
+        "processed": 0,
+        "total": 0,
+        "message": "",
+        "failure_message": "",
+    }
+
+    result_card_canvas, result_card = _create_rounded_card(app, page, radius=16)
+    result_card_canvas.grid(row=1, column=0, sticky="nsew")
+
+    detail_title_row = tk.Frame(
+        result_card,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+    )
+    detail_title_row.pack(fill="x")
+
+    tk.Label(
+        detail_title_row,
+        text="세부 동기화 항목",
+        font=app._font(13, "bold"),
+        fg=SYNC_TEXT_TITLE,
+        bg=SYNC_CARD_BG,
+        anchor="w",
+    ).pack(side="left")
+
+    sync_detail_filter_button = tk.Canvas(
+        detail_title_row,
+        width=103,
+        height=34,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+        cursor="hand2",
+    )
+    sync_detail_filter_button.pack(side="right")
+
+    detail_card_content = tk.Frame(
+        result_card,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+    )
+    detail_card_content.pack(fill="both", expand=True, pady=(8, 4))
+
+    sync_detail_rows_per_page = 4
+    sync_detail_row_height = 38
+    sync_detail_header_height = 21
+    sync_detail_footer_height = 30
+    sync_detail_col_ratios = [1.4, 2.2, 2.4, 0.8, 3.0, 1.0]
+    sync_detail_col_headers = ["상태", "파일명", "위치", "크기", "상세", "작업"]
+    sync_detail_body_height = sync_detail_rows_per_page * sync_detail_row_height
+    sync_detail_table_min_height = (
+        sync_detail_header_height
+        + sync_detail_body_height
+        + sync_detail_footer_height
+    )
+
+    sync_detail_status_meta = {
+        "registration_required": {
+            "label": "등록 필요",
+            "detail_fallback": "DMS 미등록 파일",
+            "text_color": colors.PRIMARY,
+            "detail_color": colors.PRIMARY,
+            "icon": "new_small.svg",
+        },
+        "review_required": {
+            "label": "확인 필요",
+            "detail_fallback": "등록된 경로에서 파일을 찾을 수 없음",
+            "text_color": colors.ALERT,
+            "detail_color": colors.ALERT,
+            "icon": "alert_small.svg",
+        },
+        "error": {
+            "label": "오류",
+            "detail_fallback": "파일 정보를 읽을 수 없음",
+            "text_color": colors.FAILED_STRONG,
+            "detail_color": colors.FAILED_STRONG,
+            "icon": "error_small.svg",
+        },
+    }
+
+    sync_detail_filter_options = [
+        ("all", "모두 보기"),
+        ("registration_required", "등록 필요"),
+        ("review_required", "확인 필요"),
+        ("error", "오류"),
+    ]
+
+    sync_detail_icons = {}
+    for icon_name in (
+        "new_small.svg",
+        "alert_small.svg",
+        "error_small.svg",
+        "filter.svg",
+        "expand.svg",
+        "collapse.svg",
+        "far_before.svg",
+        "before.svg",
+        "after.svg",
+        "far_after.svg",
+    ):
+        icon_path = SYNC_STATUS_ICON_DIR / icon_name
+        icon_w, icon_h = _read_svg_intrinsic_size(icon_path)
+        sync_detail_icons[icon_name] = load_svg_photo(
+            icon_path,
+            max_width=icon_w,
+            max_height=icon_h,
+        )
+
+    sync_detail_table_shell = tk.Frame(
+        detail_card_content,
+        bg=SYNC_CARD_BG,
+        highlightthickness=1,
+        highlightbackground=colors.BORDER,
+        highlightcolor=colors.BORDER,
+        bd=0,
+        height=sync_detail_table_min_height,
+    )
+    sync_detail_table_shell.pack(fill="both", expand=True, anchor="n")
+    sync_detail_table_shell.pack_propagate(False)
+
+    sync_detail_header_frame = tk.Frame(
+        sync_detail_table_shell,
+        bg=colors.SURFACE_ACCENT_SOFT,
+        highlightthickness=0,
+        bd=0,
+        height=sync_detail_header_height,
+    )
+    sync_detail_header_frame.pack(side="top", fill="x")
+    sync_detail_header_frame.pack_propagate(False)
+    sync_detail_header_frame.grid_propagate(False)
+
+    sync_detail_body_frame = tk.Frame(
+        sync_detail_table_shell,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+        height=sync_detail_body_height,
+    )
+    sync_detail_body_frame.pack(side="top", fill="x")
+    sync_detail_body_frame.pack_propagate(False)
+
+    sync_detail_footer_frame = tk.Frame(
+        sync_detail_table_shell,
+        bg=SYNC_CARD_BG,
+        highlightthickness=0,
+        bd=0,
+        height=sync_detail_footer_height,
+    )
+    sync_detail_footer_frame.pack(side="top", fill="x")
+    sync_detail_footer_frame.pack_propagate(False)
+
+    sync_detail_state = {
+        "items": [],
+        "filter_key": "all",
+        "page_index": 0,
+        "rows_per_page": sync_detail_rows_per_page,
+        "filter_popup": None,
+        "filter_popup_open": False,
+        "filter_hovered": False,
+        "filter_display_label": "모두 보기",
+        "action_states": {},
+        "refresh_job": None,
+    }
+
+    def _is_widget_alive(widget):
+        try:
+            return bool(widget.winfo_exists())
+        except Exception:
+            return False
+
+    def _is_screen_alive():
+        if runtime["destroyed"]:
+            return False
+        return _is_widget_alive(page) and _is_widget_alive(app.root)
+
+    def _is_generation_current(generation):
+        return (
+            _is_screen_alive()
+            and int(generation) == int(runtime.get("operation_generation") or 0)
+        )
+
+    def _safe_after(delay_ms, callback):
+        if not _is_screen_alive():
+            return None
+        try:
+            return app.root.after(delay_ms, callback)
+        except Exception:
+            return None
 
     def _sync_card_target_height_for_state(state_name):
         if state_name == SYNC_CARD_STATE_INITIAL:
@@ -1034,10 +1234,7 @@ def show_sync_workspace_screen(app):
             _finish_sync_card_height_animation()
             return
 
-        try:
-            sync_card_animation["anim_job"] = app.root.after(16, _animate_sync_card_height_step)
-        except Exception:
-            sync_card_animation["anim_job"] = None
+        sync_card_animation["anim_job"] = _safe_after(16, _animate_sync_card_height_step)
 
     def _start_sync_card_height_animation(target_height):
         clamped_target = max(
@@ -1067,72 +1264,12 @@ def show_sync_workspace_screen(app):
 
         try:
             sync_card_animation["anim_start_time"] = int(app.root.tk.call("clock", "milliseconds"))
-            sync_card_animation["anim_job"] = app.root.after(16, _animate_sync_card_height_step)
         except Exception:
-            sync_card_animation["anim_job"] = None
+            sync_card_animation["anim_start_time"] = 0
+
+        sync_card_animation["anim_job"] = _safe_after(16, _animate_sync_card_height_step)
+        if sync_card_animation["anim_job"] is None:
             _apply_sync_card_height(clamped_target)
-
-    def _cancel_sync_card_job():
-        job_id = sync_demo.get("job")
-        if job_id is None:
-            return
-
-        try:
-            app.root.after_cancel(job_id)
-        except Exception:
-            pass
-
-        sync_demo["job"] = None
-
-    def _cancel_loading_text_job():
-        loading_job_id = sync_demo.get("loading_job")
-        if loading_job_id is None:
-            return
-
-        try:
-            app.root.after_cancel(loading_job_id)
-        except Exception:
-            pass
-
-        sync_demo["loading_job"] = None
-
-    def _tick_loading_text_animation():
-        sync_demo["loading_job"] = None
-
-        current_state = sync_demo.get("state")
-        if current_state not in (SYNC_CARD_STATE_SCANNING, SYNC_CARD_STATE_SYNCING):
-            return
-
-        total = max(1, int(sync_demo.get("total") or 1))
-        processed = int(sync_demo.get("processed") or 0)
-        if processed >= total:
-            return
-
-        next_dot_count = int(sync_demo.get("loading_dot_count") or 1) + 1
-        if next_dot_count > 3:
-            next_dot_count = 1
-        sync_demo["loading_dot_count"] = next_dot_count
-
-        base_text = str(sync_demo.get("loading_base_text") or "")
-        _set_sync_card_state(
-            current_state,
-            message=f"{base_text}{'.' * next_dot_count}",
-        )
-
-        try:
-            sync_demo["loading_job"] = app.root.after(300, _tick_loading_text_animation)
-        except Exception:
-            sync_demo["loading_job"] = None
-
-    def _start_loading_text_animation(base_text):
-        _cancel_loading_text_job()
-        sync_demo["loading_base_text"] = str(base_text or "")
-        sync_demo["loading_dot_count"] = 1
-
-        try:
-            sync_demo["loading_job"] = app.root.after(300, _tick_loading_text_animation)
-        except Exception:
-            sync_demo["loading_job"] = None
 
     def _set_sync_card_state(
         state_name,
@@ -1141,31 +1278,1925 @@ def show_sync_workspace_screen(app):
         processed=None,
         total=None,
         message=None,
+        failure_message=None,
     ):
-        previous_state = sync_demo.get("state")
-        sync_demo["state"] = state_name
+        previous_state = sync_card_state.get("state")
+        sync_card_state["state"] = state_name
 
         if summary is not None:
-            sync_demo["summary"] = dict(summary)
+            sync_card_state["summary"] = dict(summary)
         if processed is not None:
-            sync_demo["processed"] = int(processed)
+            sync_card_state["processed"] = int(max(0, int(processed)))
         if total is not None:
-            sync_demo["total"] = int(total)
+            sync_card_state["total"] = int(max(0, int(total)))
         if message is not None:
-            sync_demo["message"] = str(message)
+            sync_card_state["message"] = str(message)
+        if failure_message is not None:
+            sync_card_state["failure_message"] = str(failure_message)
 
         if previous_state != state_name:
             _start_sync_card_height_animation(
                 _sync_card_target_height_for_state(state_name)
             )
 
-        if state_name not in (
-            SYNC_CARD_STATE_SCANNING,
-            SYNC_CARD_STATE_SYNCING,
-        ):
-            _cancel_loading_text_job()
-
         _render_sync_card()
+
+    def _refresh_card1():
+        snapshot = dict(runtime.get("latest_snapshot") or {})
+        _build_workspace_status_grid(
+            app,
+            left_card_status_host,
+            snapshot,
+        )
+
+    def _normalize_relpath_key(relative_path):
+        text = str(relative_path or "").strip()
+        if not text:
+            return ""
+        return Path(text).as_posix().casefold()
+
+    def _derive_workspace_identity():
+        workspace_id, workspace_name, workspace_root = _resolve_workspace_context(app)
+        runtime["workspace_id"] = workspace_id
+        runtime["workspace_name"] = workspace_name or "-"
+        runtime["workspace_root"] = str(workspace_root) if workspace_root else None
+        snapshot = runtime.get("latest_snapshot") or {}
+        snapshot["workspace_id"] = workspace_id
+        snapshot["workspace_name"] = workspace_name or "-"
+        snapshot["workspace_root"] = str(workspace_root) if workspace_root else None
+        runtime["latest_snapshot"] = snapshot
+        return workspace_id, workspace_name or "-", workspace_root
+
+    def _status_for_summary(summary):
+        registration_required = int(summary.get("registration_required") or 0)
+        review_required = int(summary.get("review_required") or 0)
+        error_count = int(summary.get("error") or 0)
+
+        if error_count > 0 or review_required > 0:
+            return {
+                "status_key": "sync_alert",
+                "status_text": "확인 필요",
+                "is_synced": False,
+            }
+
+        if registration_required > 0:
+            return {
+                "status_key": "sync_alert",
+                "status_text": "동기화 필요",
+                "is_synced": False,
+            }
+
+        return {
+            "status_key": "sync_pass",
+            "status_text": "정상",
+            "is_synced": True,
+        }
+
+    def _build_detail_items_from_scan(scan_report):
+        items = []
+
+        unindexed_files = list(scan_report.get("unindexed_files") or [])
+        for file_record in unindexed_files:
+            relative_path = str(file_record.get("relative_path") or "").strip()
+            filename = str(file_record.get("archived_filename") or file_record.get("original_filename") or Path(relative_path).name or "-")
+            item_id = f"nas:{_normalize_relpath_key(relative_path)}"
+
+            items.append(
+                {
+                    "item_id": item_id,
+                    "status": "registration_required",
+                    "filename": filename,
+                    "relative_path": relative_path or "-",
+                    "size_bytes": file_record.get("file_size"),
+                    "detail": "DMS 미등록 파일",
+                    "record_id": None,
+                    "file_record": dict(file_record),
+                }
+            )
+
+        missing_records = list(scan_report.get("missing_from_storage") or [])
+        for db_record in missing_records:
+            relative_path = str(db_record.get("relative_path") or "").strip()
+            record_id = db_record.get("file_id")
+            filename = str(db_record.get("archived_filename") or Path(relative_path).name or "-")
+
+            identity = str(record_id) if record_id is not None else _normalize_relpath_key(relative_path)
+            item_id = f"db:{identity}"
+
+            items.append(
+                {
+                    "item_id": item_id,
+                    "status": "review_required",
+                    "filename": filename,
+                    "relative_path": relative_path or "-",
+                    "size_bytes": None,
+                    "detail": "등록된 경로에서 파일을 찾을 수 없음",
+                    "record_id": record_id,
+                }
+            )
+
+        scan_errors = list(scan_report.get("errors") or [])
+        for idx, error in enumerate(scan_errors):
+            error_path = str(error.get("path") or "").strip()
+            error_message = str(error.get("message") or error.get("error_type") or "파일 정보를 읽을 수 없음")
+            filename = Path(error_path).name if error_path else "-"
+
+            item_id = f"err:{_normalize_relpath_key(error_path)}:{idx}"
+            items.append(
+                {
+                    "item_id": item_id,
+                    "status": "error",
+                    "filename": filename,
+                    "relative_path": error_path or "-",
+                    "size_bytes": None,
+                    "detail": error_message,
+                    "record_id": None,
+                }
+            )
+
+        return items
+
+    def _build_ui_snapshot_from_scan(
+        scan_report,
+        *,
+        has_scanned=True,
+        synced_at=None,
+    ):
+        workspace_id = runtime.get("workspace_id")
+        workspace_name = runtime.get("workspace_name") or "-"
+        workspace_root = runtime.get("workspace_root")
+
+        detail_items = _build_detail_items_from_scan(scan_report)
+
+        summary = {
+            "normal": len(scan_report.get("matched_files") or []),
+            "registration_required": len(scan_report.get("unindexed_files") or []),
+            "review_required": len(scan_report.get("missing_from_storage") or []),
+            "error": len(scan_report.get("errors") or []),
+        }
+
+        status_meta = _status_for_summary(summary)
+
+        checked_at = (
+            scan_report.get("completed_at")
+            or scan_report.get("started_at")
+            or runtime.get("latest_scan_completed_at")
+        )
+
+        return {
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+            "workspace_root": workspace_root,
+            "checked_at": checked_at,
+            "last_check_at": checked_at,
+            "last_sync_at": synced_at,
+            "nas_file_count": int(scan_report.get("files_scanned") or 0),
+            "db_file_count": int(scan_report.get("database_records_checked") or 0),
+            "summary": summary,
+            "detail_items": detail_items,
+            "status_key": status_meta["status_key"],
+            "status_text": status_meta["status_text"],
+            "is_synced": status_meta["is_synced"],
+            "has_scanned": bool(has_scanned),
+        }
+
+    def _build_ui_snapshot_from_workflow(
+        workflow,
+    ):
+        if not isinstance(workflow, dict):
+            raise TypeError("workflow must be a dictionary.")
+
+        apply_changes = bool(workflow.get("apply_changes"))
+
+        if apply_changes and isinstance(workflow.get("verification_scan"), dict):
+            scan_report = workflow["verification_scan"]
+        else:
+            scan_report = workflow.get("initial_scan")
+
+        if not isinstance(scan_report, dict):
+            raise ValueError("workflow does not contain a valid scan report.")
+
+        synced_at = runtime.get("last_sync_at")
+
+        snapshot = _build_ui_snapshot_from_scan(
+            scan_report,
+            has_scanned=True,
+            synced_at=synced_at,
+        )
+
+        return snapshot
+
+    def _commit_reconciliation_snapshot(
+        snapshot,
+        *,
+        workflow=None,
+        card2_state=None,
+        card2_message=None,
+    ):
+        runtime["latest_snapshot"] = dict(snapshot)
+        runtime["latest_workflow"] = dict(workflow) if isinstance(workflow, dict) else runtime.get("latest_workflow")
+
+        if isinstance(workflow, dict):
+            scan_report = None
+            if bool(workflow.get("apply_changes")):
+                scan_report = workflow.get("verification_scan") or workflow.get("initial_scan")
+            else:
+                scan_report = workflow.get("initial_scan")
+
+            if isinstance(scan_report, dict):
+                runtime["latest_scan_report"] = dict(scan_report)
+
+        runtime["latest_scan_completed_at"] = snapshot.get("last_check_at")
+        runtime["last_sync_at"] = snapshot.get("last_sync_at")
+        runtime["has_scanned"] = bool(snapshot.get("has_scanned"))
+
+        app.sync_last_check_at = snapshot.get("last_check_at")
+        app.sync_last_sync_at = snapshot.get("last_sync_at")
+
+        sync_detail_state["items"] = list(snapshot.get("detail_items") or [])
+        sync_detail_state["action_states"].clear()
+
+        summary = dict(snapshot.get("summary") or {})
+        runtime["processed"] = 0
+        runtime["total"] = 0
+        runtime["message"] = ""
+
+        target_state = card2_state or SYNC_CARD_STATE_RESULT
+        target_message = card2_message
+
+        if target_state == SYNC_CARD_STATE_COMPLETE and not target_message:
+            target_message = "동기화가 완료되었어요."
+
+        _set_sync_card_state(
+            target_state,
+            summary=summary,
+            processed=0,
+            total=0,
+            message=target_message or "",
+            failure_message="",
+        )
+
+        _refresh_workspace_sync_views()
+
+    def _begin_operation(operation_name):
+        if runtime["busy"]:
+            return None
+        if runtime["destroyed"]:
+            return None
+
+        workspace_id, workspace_name, workspace_root = _derive_workspace_identity()
+
+        if runtime.get("service") is None:
+            fail_reason = runtime.get("service_init_error") or "재조정 서비스를 초기화할 수 없습니다."
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message=fail_reason,
+            )
+            return None
+
+        if workspace_id is None:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message="활성 워크스페이스를 확인할 수 없습니다.",
+            )
+            return None
+
+        if not workspace_root:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message="워크스페이스 경로 정보를 확인할 수 없습니다.",
+            )
+            return None
+
+        runtime["busy"] = True
+        runtime["operation"] = str(operation_name)
+        runtime["operation_generation"] = int(runtime.get("operation_generation") or 0) + 1
+        runtime["failure_message"] = ""
+        runtime["message"] = ""
+        runtime["processed"] = 0
+        runtime["total"] = 0
+
+        return {
+            "generation": int(runtime["operation_generation"]),
+            "workspace_id": int(workspace_id),
+            "workspace_name": workspace_name,
+            "workspace_root": str(workspace_root),
+        }
+
+    def _finish_operation(generation):
+        if int(generation) != int(runtime.get("operation_generation") or 0):
+            return
+        runtime["busy"] = False
+        runtime["operation"] = None
+
+    def _record_workspace_check_timestamp(
+        workspace_id,
+        timestamp,
+    ):
+        db = getattr(app, "db", None)
+        recorder = getattr(db, "record_workspace_reconciliation_check", None)
+
+        if not callable(recorder):
+            raise RuntimeError(
+                "워크스페이스 검사 시각을 저장할 수 없습니다."
+            )
+
+        return recorder(
+            workspace_id,
+            timestamp=timestamp,
+        )
+
+    def _record_workspace_sync_timestamps(
+        workspace_id,
+        *,
+        sync_timestamp,
+        check_timestamp,
+    ):
+        db = getattr(app, "db", None)
+        recorder = getattr(db, "record_workspace_reconciliation_sync", None)
+
+        if not callable(recorder):
+            raise RuntimeError(
+                "워크스페이스 동기화 시각을 저장할 수 없습니다."
+            )
+
+        return recorder(
+            workspace_id,
+            sync_timestamp=sync_timestamp,
+            check_timestamp=check_timestamp,
+        )
+
+    def _get_workspace_reconciliation_state(workspace_id):
+        db = getattr(app, "db", None)
+        getter = getattr(db, "get_workspace_reconciliation_state", None)
+
+        if not callable(getter):
+            raise RuntimeError(
+                "워크스페이스 동기화 상태를 조회할 수 없습니다."
+            )
+
+        state_row = getter(workspace_id)
+
+        if not isinstance(state_row, dict):
+            raise RuntimeError(
+                "워크스페이스 동기화 상태 형식이 올바르지 않습니다."
+            )
+
+        return {
+            "last_check_at": state_row.get("last_check_at"),
+            "last_sync_at": state_row.get("last_sync_at"),
+        }
+
+    def _get_workflow_scan_report(workflow):
+        if not isinstance(workflow, dict):
+            raise TypeError("workflow must be a dictionary.")
+
+        apply_changes = bool(workflow.get("apply_changes"))
+
+        if apply_changes and isinstance(workflow.get("verification_scan"), dict):
+            scan_report = workflow.get("verification_scan")
+        else:
+            scan_report = workflow.get("initial_scan")
+
+        if not isinstance(scan_report, dict):
+            raise ValueError("workflow does not contain a valid scan report.")
+
+        return scan_report
+
+    def _derive_workflow_check_timestamp(workflow):
+        scan_report = _get_workflow_scan_report(workflow)
+
+        return (
+            scan_report.get("completed_at")
+            or scan_report.get("started_at")
+            or workflow.get("completed_at")
+        )
+
+    def _derive_workflow_sync_timestamp(workflow):
+        scan_report = _get_workflow_scan_report(workflow)
+
+        return (
+            workflow.get("completed_at")
+            or scan_report.get("completed_at")
+            or scan_report.get("started_at")
+        )
+
+    def _get_verification_scan_from_workflow(workflow):
+        if not isinstance(workflow, dict):
+            return None
+
+        verification_scan = workflow.get("verification_scan")
+
+        if not isinstance(verification_scan, dict):
+            return None
+
+        return verification_scan
+
+    def _is_verified_sync_success(workflow):
+        if not isinstance(workflow, dict):
+            return False
+
+        if not bool(workflow.get("apply_changes")):
+            return False
+
+        verification_scan = _get_verification_scan_from_workflow(
+            workflow
+        )
+
+        if verification_scan is None:
+            return False
+
+        status_value = str(
+            workflow.get("status") or ""
+        ).strip().lower()
+
+        expected = str(
+            WorkspaceReconciliationService.WORKFLOW_APPLIED
+        ).strip().lower()
+
+        return status_value == expected
+
+    def _is_verified_manual_registration_success(
+        register_result,
+        verification_workflow,
+        target_relative_path,
+    ):
+        if not isinstance(register_result, dict):
+            return False
+
+        register_status = str(
+            register_result.get("status") or ""
+        ).strip().lower()
+
+        if register_status != "completed":
+            return False
+
+        try:
+            verification_scan = _get_workflow_scan_report(
+                verification_workflow
+            )
+        except Exception:
+            return False
+
+        if not isinstance(verification_scan, dict):
+            return False
+
+        if verification_scan.get("errors"):
+            return False
+
+        unindexed_files = verification_scan.get(
+            "unindexed_files"
+        )
+
+        if not isinstance(unindexed_files, list):
+            return False
+
+        target_key = _normalize_relpath_key(
+            target_relative_path
+        )
+
+        if not target_key:
+            return False
+
+        for candidate in unindexed_files:
+            if not isinstance(candidate, dict):
+                continue
+
+            candidate_key = _normalize_relpath_key(
+                candidate.get("relative_path")
+            )
+
+            if candidate_key and candidate_key == target_key:
+                return False
+
+        return True
+
+    def _progress_message(event_name, operation_name):
+        if event_name == "file_scanned":
+            return "워크스페이스 파일을 검사하고 있어요."
+        if event_name in ("matched_file", "unindexed_file"):
+            return "NAS와 DMS 정보를 비교하고 있어요."
+        if event_name in ("file_error", "directory_error"):
+            return "일부 항목을 확인하는 중 오류가 발생했어요."
+        if event_name in ("apply_file_started", "apply_file_inserted", "apply_file_skipped", "apply_file_failed"):
+            return "데이터베이스를 동기화하고 있어요."
+        if event_name == "status_reconciled":
+            return "DMS 데이터베이스를 확인하고 있어요."
+        if event_name == "scan_completed":
+            return "워크스페이스 검사 결과를 확인하고 있어요."
+        if event_name == "workflow_started":
+            if operation_name == "scan":
+                return "워크스페이스 파일을 검사하고 있어요."
+            return "동기화 작업을 준비하고 있어요."
+        if event_name == "workflow_completed":
+            return "작업을 마무리하고 있어요."
+        if event_name == "register_item_started":
+            return "선택한 파일을 등록하고 있어요."
+        if event_name == "register_item_completed":
+            return "등록 결과를 확인하고 있어요."
+        if event_name == "register_item_failed":
+            return "파일 등록 중 오류가 발생했어요."
+        return "작업을 진행하고 있어요."
+
+    def _progress_counts(event):
+        event_name = str(event.get("event") or "")
+
+        if event_name == "file_scanned":
+            return (
+                int(event.get("files_scanned") or 0),
+                0,
+            )
+
+        if event_name in ("apply_file_started", "apply_file_inserted", "apply_file_skipped", "apply_file_failed"):
+            total = int(event.get("total") or 0)
+            index = int(event.get("index") or 0)
+            return (index, total)
+
+        if event_name == "apply_completed":
+            total = int(event.get("requested") or 0)
+            done = int(event.get("inserted_count") or 0) + int(event.get("skipped_count") or 0) + int(event.get("failed_count") or 0)
+            return (done, total)
+
+        return (
+            int(runtime.get("processed") or 0),
+            int(runtime.get("total") or 0),
+        )
+
+    def _enqueue_worker_event(
+        generation,
+        kind,
+        operation,
+        *,
+        payload=None,
+        error_type=None,
+        message=None,
+    ):
+        event = {
+            "generation": int(generation),
+            "kind": str(kind or ""),
+            "operation": str(operation or ""),
+            "payload": dict(payload or {}),
+        }
+
+        if error_type is not None:
+            event["error_type"] = str(error_type)
+        if message is not None:
+            event["message"] = str(message)
+
+        runtime["worker_events"].put(event)
+
+    def _worker_progress_callback(
+        generation,
+        operation_name,
+    ):
+        def _callback(event):
+            payload = dict(event) if isinstance(event, dict) else {}
+            _enqueue_worker_event(
+                generation,
+                "progress",
+                operation_name,
+                payload=payload,
+            )
+
+        return _callback
+
+    def _handle_progress_event(event_message):
+        if not runtime.get("busy"):
+            return
+
+        operation_name = str(event_message.get("operation") or "")
+        current_operation = str(runtime.get("operation") or "")
+
+        if current_operation and operation_name != current_operation:
+            return
+
+        event_payload = event_message.get("payload")
+        if not isinstance(event_payload, dict):
+            event_payload = {}
+
+        message = _progress_message(
+            str(event_payload.get("event") or ""),
+            operation_name,
+        )
+        processed, total = _progress_counts(event_payload)
+
+        runtime["message"] = message
+        runtime["processed"] = max(0, int(processed))
+        runtime["total"] = max(0, int(total))
+
+        card_state = (
+            SYNC_CARD_STATE_SCANNING
+            if operation_name == "scan"
+            else SYNC_CARD_STATE_SYNCING
+        )
+
+        _set_sync_card_state(
+            card_state,
+            summary=dict((runtime.get("latest_snapshot") or {}).get("summary") or {}),
+            processed=runtime["processed"],
+            total=runtime["total"],
+            message=runtime["message"],
+        )
+
+    def _handle_scan_success(
+        generation,
+        payload,
+    ):
+        if not _is_generation_current(generation):
+            return
+
+        workflow = payload.get("workflow")
+        persisted_check_at = payload.get("persisted_check_at")
+
+        try:
+            snapshot = _build_ui_snapshot_from_workflow(workflow)
+            snapshot["last_check_at"] = persisted_check_at
+            _commit_reconciliation_snapshot(
+                snapshot,
+                workflow=workflow,
+                card2_state=SYNC_CARD_STATE_RESULT,
+            )
+        except Exception as exc:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            _finish_operation(generation)
+
+    def _handle_manual_register_success(
+        generation,
+        payload,
+    ):
+        if not _is_generation_current(generation):
+            return
+
+        workflow = payload.get("workflow")
+        persisted_state = payload.get("persisted_state")
+        if not isinstance(persisted_state, dict):
+            persisted_state = {}
+
+        try:
+            snapshot = _build_ui_snapshot_from_workflow(workflow)
+            snapshot["last_check_at"] = persisted_state.get("last_check_at")
+            snapshot["last_sync_at"] = persisted_state.get("last_sync_at")
+            _commit_reconciliation_snapshot(
+                snapshot,
+                workflow=workflow,
+                card2_state=SYNC_CARD_STATE_RESULT,
+            )
+        except Exception as exc:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            _finish_operation(generation)
+
+    def _handle_auto_sync_success(
+        generation,
+        payload,
+    ):
+        if not _is_generation_current(generation):
+            return
+
+        workflow = payload.get("workflow")
+        persisted_state = payload.get("persisted_state")
+        if not isinstance(persisted_state, dict):
+            persisted_state = {}
+
+        inserted_count = int(payload.get("inserted_count") or 0)
+        failed_count = int(payload.get("failed_count") or 0)
+        verified_sync_success = bool(
+            payload.get("verified_sync_success")
+        )
+
+        try:
+            runtime["last_apply_inserted_count"] = inserted_count
+            runtime["last_apply_failed_count"] = failed_count
+
+            snapshot = _build_ui_snapshot_from_workflow(
+                workflow,
+            )
+            snapshot["last_check_at"] = persisted_state.get("last_check_at")
+            snapshot["last_sync_at"] = persisted_state.get("last_sync_at")
+
+            _commit_reconciliation_snapshot(
+                snapshot,
+                workflow=workflow,
+                card2_state=(
+                    SYNC_CARD_STATE_COMPLETE
+                    if verified_sync_success
+                    else SYNC_CARD_STATE_RESULT
+                ),
+            )
+        except Exception as exc:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            _finish_operation(generation)
+
+    def _dispatch_worker_success_event(event_message):
+        generation = int(event_message.get("generation") or 0)
+        operation_name = str(event_message.get("operation") or "")
+        payload = event_message.get("payload")
+
+        if not isinstance(payload, dict):
+            payload = {}
+
+        if operation_name == "scan":
+            _handle_scan_success(generation, payload)
+            return
+
+        if operation_name == "auto_sync":
+            _handle_auto_sync_success(generation, payload)
+            return
+
+        if operation_name == "manual_register":
+            _handle_manual_register_success(generation, payload)
+            return
+
+    def _dispatch_worker_failure_event(event_message):
+        generation = int(event_message.get("generation") or 0)
+
+        if not _is_generation_current(generation):
+            return
+
+        operation_name = str(event_message.get("operation") or "")
+        payload = event_message.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+
+        error_type = str(event_message.get("error_type") or "RuntimeError")
+        error_message = str(event_message.get("message") or "작업 중 오류가 발생했습니다.")
+        failure_message = f"{error_type}: {error_message}"
+
+        if operation_name == "manual_register":
+            item_id = str(payload.get("item_id") or "")
+            if item_id:
+                sync_detail_state["action_states"].pop(item_id, None)
+
+        _set_sync_card_state(
+            SYNC_CARD_STATE_FAILED,
+            failure_message=failure_message,
+        )
+        _refresh_sync_detail_view()
+        _finish_operation(generation)
+
+    def _poll_worker_events():
+        runtime["worker_poll_job"] = None
+
+        if not _is_screen_alive():
+            return
+
+        current_generation = int(runtime.get("operation_generation") or 0)
+        latest_progress_event = None
+        completion_events = []
+        drained_count = 0
+
+        while drained_count < 512:
+            try:
+                event_message = runtime["worker_events"].get_nowait()
+            except queue.Empty:
+                break
+
+            drained_count += 1
+
+            if not isinstance(event_message, dict):
+                continue
+
+            try:
+                generation = int(event_message.get("generation"))
+            except (TypeError, ValueError):
+                continue
+
+            if generation != current_generation:
+                continue
+
+            kind = str(event_message.get("kind") or "")
+
+            if kind == "progress":
+                latest_progress_event = event_message
+                continue
+
+            if kind in {"success", "failure"}:
+                completion_events.append(event_message)
+
+        completion_processed = False
+
+        for event_message in completion_events:
+            kind = str(event_message.get("kind") or "")
+
+            if kind == "success":
+                _dispatch_worker_success_event(event_message)
+                completion_processed = True
+                continue
+
+            if kind == "failure":
+                _dispatch_worker_failure_event(event_message)
+                completion_processed = True
+
+        if (not completion_processed) and latest_progress_event is not None:
+            _handle_progress_event(latest_progress_event)
+
+        if _is_screen_alive():
+            runtime["worker_poll_job"] = _safe_after(80, _poll_worker_events)
+
+    def _start_worker_event_poller():
+        if runtime.get("worker_poll_job") is not None:
+            return
+        runtime["worker_poll_job"] = _safe_after(80, _poll_worker_events)
+
+    def _format_sync_detail_file_size(size_bytes):
+        if size_bytes is None:
+            return "-"
+
+        try:
+            size_value = float(size_bytes)
+        except (TypeError, ValueError):
+            return "-"
+
+        units = ("B", "KB", "MB", "GB", "TB")
+        unit_index = 0
+
+        while size_value >= 1024.0 and unit_index < len(units) - 1:
+            size_value /= 1024.0
+            unit_index += 1
+
+        if unit_index == 0:
+            return f"{int(size_value)} {units[unit_index]}"
+        if size_value >= 100:
+            return f"{size_value:.0f} {units[unit_index]}"
+        if size_value >= 10:
+            return f"{size_value:.1f} {units[unit_index]}"
+        return f"{size_value:.2f} {units[unit_index]}"
+
+    def _truncate_sync_detail_text(text, max_width_px, font_spec):
+        value = str(text or "")
+        if max_width_px <= 0 or not value:
+            return ""
+
+        font_obj = tkfont.Font(root=app.root, font=font_spec)
+        if font_obj.measure(value) <= max_width_px:
+            return value
+
+        ellipsis = "…"
+        ellipsis_width = font_obj.measure(ellipsis)
+        if ellipsis_width >= max_width_px:
+            return ""
+
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            candidate = value[:mid].rstrip() + ellipsis
+            if font_obj.measure(candidate) <= max_width_px:
+                lo = mid
+            else:
+                hi = mid - 1
+
+        return value[:lo].rstrip() + ellipsis
+
+    def _get_sync_detail_column_widths(total_width):
+        width = max(780, int(total_width))
+        ratio_total = sum(sync_detail_col_ratios) or 1
+        col_widths = [
+            int(width * (ratio / ratio_total))
+            for ratio in sync_detail_col_ratios
+        ]
+        col_widths[-1] += max(0, width - sum(col_widths))
+        return col_widths
+
+    def _get_sync_detail_table_metrics():
+        table_height = int(sync_detail_table_shell.winfo_height())
+        if table_height <= 1:
+            table_height = int(sync_detail_table_min_height)
+
+        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
+        header_height = max(18, int(sync_detail_header_height))
+        row_height = max(24, int(sync_detail_row_height))
+        body_height = row_height * rows_per_page
+        footer_height = int(table_height - header_height - body_height)
+
+        if footer_height < 12:
+            needed = 12 - footer_height
+            header_reducible = max(0, header_height - 18)
+            take = min(needed, header_reducible)
+            header_height -= take
+            needed -= take
+
+            if needed > 0:
+                shrink_rows = int((needed + rows_per_page - 1) // rows_per_page)
+                row_height = max(24, row_height - shrink_rows)
+                body_height = row_height * rows_per_page
+
+            footer_height = max(12, int(table_height - header_height - body_height))
+
+        return {
+            "table_height": max(1, int(table_height)),
+            "header_height": max(1, int(header_height)),
+            "row_height": max(1, int(row_height)),
+            "body_height": max(1, int(body_height)),
+            "footer_height": max(1, int(footer_height)),
+        }
+
+    def _configure_sync_detail_columns(frame, col_widths):
+        frame.grid_rowconfigure(0, weight=1)
+        for idx, col_width in enumerate(col_widths):
+            frame.grid_columnconfigure(
+                idx,
+                minsize=max(40, int(col_width)),
+                weight=0,
+            )
+
+    def _draw_sync_detail_column_separators(parent, col_widths, height_px):
+        return
+
+    def _get_sync_detail_status_meta(status_key):
+        return sync_detail_status_meta.get(
+            status_key,
+            sync_detail_status_meta["error"],
+        )
+
+    def _apply_sync_detail_filter(items):
+        filter_key = str(sync_detail_state.get("filter_key") or "all")
+        if filter_key == "all":
+            return list(items)
+
+        return [
+            item
+            for item in items
+            if str(item.get("status")) == filter_key
+        ]
+
+    def _get_sync_detail_page_count(filtered_items):
+        total_count = len(filtered_items)
+        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
+        return max(1, (total_count + rows_per_page - 1) // rows_per_page)
+
+    def _clamp_sync_detail_page(filtered_items):
+        page_count = _get_sync_detail_page_count(filtered_items)
+        sync_detail_state["page_index"] = max(
+            0,
+            min(
+                int(sync_detail_state["page_index"]),
+                page_count - 1,
+            ),
+        )
+
+    def _get_sync_detail_page_items(filtered_items):
+        _clamp_sync_detail_page(filtered_items)
+        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
+        start_index = int(sync_detail_state["page_index"]) * rows_per_page
+        end_index = start_index + rows_per_page
+        return filtered_items[start_index:end_index]
+
+    def _draw_sync_detail_filter_button():
+        if not _is_widget_alive(sync_detail_filter_button):
+            return
+
+        try:
+            sync_detail_filter_button.delete("all")
+        except Exception:
+            return
+
+        button_width = max(88, int(sync_detail_filter_button.winfo_width()))
+        button_height = max(30, int(sync_detail_filter_button.winfo_height()))
+
+        fill_color = colors.SURFACE_HOVER if sync_detail_state.get("filter_hovered") else colors.SURFACE_ALT
+        border_color = colors.BORDER
+
+        app._smooth_rounded_rect(
+            sync_detail_filter_button,
+            1,
+            1,
+            button_width - 1,
+            button_height - 1,
+            11,
+            fill=fill_color,
+            outline=border_color,
+            width=1,
+        )
+
+        filter_icon = sync_detail_icons.get("filter.svg")
+        if filter_icon is not None:
+            sync_detail_filter_button.create_image(
+                16,
+                button_height / 2.0,
+                image=filter_icon,
+                anchor="center",
+            )
+
+        sync_detail_filter_button.create_text(
+            30,
+            button_height / 2.0,
+            text=str(sync_detail_state.get("filter_display_label") or "모두 보기"),
+            fill=SYNC_TEXT_TITLE,
+            font=app._font(10, "bold"),
+            anchor="w",
+        )
+
+        expand_icon_key = "collapse.svg" if sync_detail_state.get("filter_popup_open") else "expand.svg"
+        expand_icon = sync_detail_icons.get(expand_icon_key)
+
+        if expand_icon is not None:
+            sync_detail_filter_button.create_image(
+                button_width - 16,
+                button_height / 2.0,
+                image=expand_icon,
+                anchor="center",
+            )
+
+    def _close_sync_detail_filter_popup(*, redraw=True):
+        popup = sync_detail_state.get("filter_popup")
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+
+        sync_detail_state["filter_popup"] = None
+        sync_detail_state["filter_popup_open"] = False
+        if redraw:
+            _draw_sync_detail_filter_button()
+
+    def _set_sync_detail_filter(filter_key):
+        sync_detail_state["filter_key"] = str(filter_key)
+        sync_detail_state["filter_display_label"] = next(
+            (
+                label
+                for key, label in sync_detail_filter_options
+                if key == filter_key
+            ),
+            "모두 보기",
+        )
+        sync_detail_state["page_index"] = 0
+        _close_sync_detail_filter_popup()
+        _refresh_sync_detail_view()
+
+    def _open_sync_detail_filter_popup():
+        if not _is_widget_alive(sync_detail_filter_button):
+            return
+
+        _close_sync_detail_filter_popup()
+
+        popup_width = max(120, int(sync_detail_filter_button.winfo_width()))
+        popup_rows = len(sync_detail_filter_options)
+        option_row_height = 32
+        popup_height = (popup_rows * option_row_height) + 12
+        popup_x = sync_detail_filter_button.winfo_rootx()
+        popup_y = sync_detail_filter_button.winfo_rooty() + sync_detail_filter_button.winfo_height() + 2
+
+        popup = tk.Toplevel(app.root)
+        popup.overrideredirect(True)
+        popup.transient(app.root)
+        popup.configure(bg=colors.SURFACE_ALT)
+        popup.geometry(f"{popup_width}x{popup_height}+{popup_x}+{popup_y}")
+        popup.lift()
+        popup.focus_force()
+
+        shell_canvas = tk.Canvas(
+            popup,
+            bg=colors.SURFACE_ALT,
+            highlightthickness=0,
+            bd=0,
+        )
+        shell_canvas.pack(fill="both", expand=True)
+
+        def _draw_popup_shell(width_value, height_value):
+            shell_canvas.delete("popup_shell_bg")
+            app._smooth_rounded_rect(
+                shell_canvas,
+                1,
+                1,
+                max(2, int(width_value) - 1),
+                max(2, int(height_value) - 1),
+                10,
+                fill=colors.SURFACE_ALT,
+                outline=colors.BORDER,
+                width=1,
+                tags="popup_shell_bg",
+            )
+            shell_canvas.tag_lower("popup_shell_bg")
+
+        _draw_popup_shell(popup_width, popup_height)
+        shell_canvas.bind(
+            "<Configure>",
+            lambda event: _draw_popup_shell(event.width, event.height),
+            add="+",
+        )
+
+        body = tk.Frame(
+            shell_canvas,
+            bg=colors.SURFACE_ALT,
+            bd=0,
+            highlightthickness=0,
+        )
+
+        shell_canvas.create_window(
+            2,
+            2,
+            anchor="nw",
+            window=body,
+            width=max(1, popup_width - 4),
+            height=max(1, popup_height - 4),
+        )
+
+        current_key = str(sync_detail_state.get("filter_key") or "all")
+
+        def _build_option_row(option_key, option_label):
+            row_shell = tk.Frame(
+                body,
+                bg=colors.SURFACE_ALT,
+                bd=0,
+                highlightthickness=0,
+                height=option_row_height,
+            )
+            row_shell.pack(fill="x")
+            row_shell.pack_propagate(False)
+
+            is_current = option_key == current_key
+            row_bg = colors.SURFACE_HOVER_SOFT if is_current else colors.SURFACE_ALT
+            row_text_color = colors.PRIMARY if is_current else SYNC_TEXT_TITLE
+
+            row_label = tk.Label(
+                row_shell,
+                text=option_label,
+                font=app._font(10, "bold") if is_current else app._font(10),
+                fg=row_text_color,
+                bg=row_bg,
+                anchor="w",
+                justify="left",
+                padx=10,
+            )
+            row_label.pack(fill="both", expand=True)
+
+            def _apply_row_bg(bg_color):
+                try:
+                    row_shell.configure(bg=bg_color)
+                except Exception:
+                    pass
+                try:
+                    row_label.configure(bg=bg_color)
+                except Exception:
+                    pass
+
+            def _on_row_enter(_event=None):
+                _apply_row_bg(colors.SURFACE_HOVER_SOFT)
+
+            def _on_row_leave(_event=None):
+                _apply_row_bg(row_bg)
+
+            def _on_row_click(_event=None):
+                _set_sync_detail_filter(option_key)
+                return "break"
+
+            for widget in (row_shell, row_label):
+                widget.bind("<Enter>", _on_row_enter, add="+")
+                widget.bind("<Leave>", _on_row_leave, add="+")
+                widget.bind("<Button-1>", _on_row_click, add="+")
+
+        for option_key, option_label in sync_detail_filter_options:
+            _build_option_row(option_key, option_label)
+
+        popup.bind("<Escape>", lambda _event: _close_sync_detail_filter_popup())
+
+        sync_detail_state["filter_popup"] = popup
+        sync_detail_state["filter_popup_open"] = True
+        _draw_sync_detail_filter_button()
+
+    def _toggle_sync_detail_filter_popup(_event=None):
+        if sync_detail_state.get("filter_popup_open"):
+            _close_sync_detail_filter_popup()
+        else:
+            _open_sync_detail_filter_popup()
+        return "break"
+
+    def _current_authenticated_user():
+        return str(
+            state.session_account_name
+            or state.session_username
+            or ""
+        ).strip()
+
+    def _start_manual_register(item_id):
+        item_id = str(item_id or "")
+        if not item_id:
+            return
+
+        if runtime["busy"]:
+            return
+
+        snapshot = runtime.get("latest_snapshot") or {}
+        detail_items = list(snapshot.get("detail_items") or [])
+        target_item = None
+        for item in detail_items:
+            if str(item.get("item_id")) == item_id and str(item.get("status")) == "registration_required":
+                target_item = dict(item)
+                break
+
+        if target_item is None:
+            return
+
+        acting_user = _current_authenticated_user()
+        if not acting_user:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message="현재 로그인 사용자 정보를 확인할 수 없어 등록을 진행할 수 없습니다.",
+            )
+            return
+
+        operation = _begin_operation("manual_register")
+        if operation is None:
+            return
+
+        generation = operation["generation"]
+        workspace_id = operation["workspace_id"]
+        workspace_root = operation["workspace_root"]
+
+        sync_detail_state["action_states"][item_id] = "registering"
+        _set_sync_card_state(
+            SYNC_CARD_STATE_SYNCING,
+            summary=dict(snapshot.get("summary") or {}),
+            processed=0,
+            total=1,
+            message="선택한 파일을 등록하고 있어요.",
+        )
+        _refresh_sync_detail_view()
+
+        service_instance = runtime.get("service")
+
+        def _worker():
+            try:
+                register_result = service_instance.register_nas_only_item(
+                    workspace_id,
+                    workspace_root,
+                    dict(target_item.get("file_record") or {}),
+                    acting_user=acting_user,
+                    progress_callback=_worker_progress_callback(generation, "manual_register"),
+                )
+
+                if str(register_result.get("status") or "") != "completed":
+                    error_info = register_result.get("error") or {}
+                    error_message = str(error_info.get("message") or "파일 등록에 실패했습니다.")
+                    raise RuntimeError(error_message)
+
+                workflow = service_instance.reconcile_workspace(
+                    workspace_id,
+                    workspace_root,
+                    apply_changes=False,
+                    progress_callback=_worker_progress_callback(generation, "manual_register"),
+                )
+
+                verification_scan = _get_workflow_scan_report(
+                    workflow
+                )
+
+                verification_check_at = (
+                    verification_scan.get("completed_at")
+                    or verification_scan.get("started_at")
+                    or workflow.get("completed_at")
+                )
+
+                persisted_check_at = _record_workspace_check_timestamp(
+                    workspace_id,
+                    verification_check_at,
+                )
+
+                verified_sync_success = _is_verified_manual_registration_success(
+                    register_result,
+                    workflow,
+                    target_item.get("relative_path"),
+                )
+
+                if verified_sync_success:
+                    persisted_state = _record_workspace_sync_timestamps(
+                        workspace_id,
+                        sync_timestamp=register_result.get("completed_at"),
+                        check_timestamp=persisted_check_at,
+                    )
+                else:
+                    persisted_state = _get_workspace_reconciliation_state(
+                        workspace_id,
+                    )
+                    persisted_state["last_check_at"] = persisted_check_at
+
+                persisted_state = {
+                    "last_check_at": persisted_state.get("last_check_at"),
+                    "last_sync_at": persisted_state.get("last_sync_at"),
+                }
+
+                _enqueue_worker_event(
+                    generation,
+                    "success",
+                    "manual_register",
+                    payload={
+                        "workflow": workflow,
+                        "persisted_state": persisted_state,
+                        "verified_sync_success": verified_sync_success,
+                    },
+                )
+
+            except Exception as exc:
+                _enqueue_worker_event(
+                    generation,
+                    "failure",
+                    "manual_register",
+                    payload={"item_id": item_id},
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as exc:
+            sync_detail_state["action_states"].pop(item_id, None)
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message=f"{type(exc).__name__}: {exc}",
+            )
+            _refresh_sync_detail_view()
+            _finish_operation(generation)
+
+    def _build_sync_detail_action_button(parent, item_id):
+        button_canvas = tk.Canvas(
+            parent,
+            width=74,
+            height=30,
+            bg=parent.cget("bg"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+
+        button_state = {"hovered": False}
+
+        def _draw_button(hovered=False):
+            button_canvas.delete("all")
+
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+            is_enabled = (action_state == "idle") and (not runtime["busy"])
+
+            if action_state == "registering":
+                fill_color = colors.SURFACE_HOVER
+                border_color = colors.BORDER
+                text_color = SYNC_TEXT_LABEL
+                label_text = "등록 중…"
+            else:
+                fill_color = colors.SURFACE_HOVER_SOFT if hovered and is_enabled else colors.SURFACE_ALT
+                border_color = colors.PRIMARY
+                text_color = colors.PRIMARY
+                label_text = "등록"
+
+            app._smooth_rounded_rect(
+                button_canvas,
+                1,
+                1,
+                73,
+                29,
+                9,
+                fill=fill_color,
+                outline=border_color,
+                width=1,
+            )
+
+            button_canvas.create_text(
+                37,
+                15,
+                text=label_text,
+                fill=text_color,
+                font=app._font(10, "bold"),
+                anchor="center",
+            )
+
+            button_canvas.configure(cursor="hand2" if is_enabled else "")
+
+        def _on_enter(_event=None):
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+            if action_state != "idle" or runtime["busy"]:
+                return
+            button_state["hovered"] = True
+            _draw_button(hovered=True)
+
+        def _on_leave(_event=None):
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+            if action_state != "idle" or runtime["busy"]:
+                return
+            button_state["hovered"] = False
+            _draw_button(hovered=False)
+
+        def _on_click(_event=None):
+            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
+            if action_state != "idle" or runtime["busy"]:
+                return "break"
+            _start_manual_register(item_id)
+            return "break"
+
+        button_canvas.bind("<Enter>", _on_enter, add="+")
+        button_canvas.bind("<Leave>", _on_leave, add="+")
+        button_canvas.bind("<Button-1>", _on_click, add="+")
+
+        _draw_button(hovered=False)
+        return button_canvas
+
+    def _build_sync_detail_pagination_icon_button(parent, icon_name, *, enabled, command):
+        button_canvas = tk.Canvas(
+            parent,
+            width=30,
+            height=28,
+            bg=parent.cget("bg"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2" if enabled else "",
+        )
+        icon_photo = sync_detail_icons.get(icon_name)
+
+        def _draw_button():
+            button_canvas.delete("all")
+            if enabled:
+                fill_color = colors.SURFACE_ALT
+                border_color = colors.BORDER
+            else:
+                fill_color = colors.SURFACE_ALT
+                border_color = colors.SURFACE_ALT
+
+            app._smooth_rounded_rect(
+                button_canvas,
+                1,
+                1,
+                29,
+                27,
+                8,
+                fill=fill_color,
+                outline=border_color,
+                width=1,
+            )
+
+            if icon_photo is not None:
+                button_canvas.create_image(
+                    15,
+                    14,
+                    image=icon_photo,
+                    anchor="center",
+                )
+
+            button_canvas.configure(cursor="hand2" if enabled else "")
+
+        def _on_click(_event=None):
+            if not enabled:
+                return "break"
+            command()
+            return "break"
+
+        button_canvas.bind("<Button-1>", _on_click, add="+")
+
+        _draw_button()
+        return button_canvas
+
+    def _set_sync_detail_page(page_index):
+        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
+        page_count = _get_sync_detail_page_count(filtered_items)
+
+        sync_detail_state["page_index"] = max(
+            0,
+            min(int(page_index), page_count - 1),
+        )
+        _refresh_sync_detail_view()
+
+    def _render_sync_detail_header(col_widths, header_height):
+        for child in sync_detail_header_frame.winfo_children():
+            child.destroy()
+
+        _configure_sync_detail_columns(sync_detail_header_frame, col_widths)
+
+        for col_idx, header_text in enumerate(sync_detail_col_headers):
+            tk.Label(
+                sync_detail_header_frame,
+                text=header_text,
+                font=app._font(10, "bold"),
+                fg=SYNC_TEXT_TITLE,
+                bg=colors.SURFACE_ACCENT_SOFT,
+                anchor="center",
+                justify="center",
+            ).grid(
+                row=0,
+                column=col_idx,
+                sticky="nsew",
+                padx=(4, 4),
+            )
+
+        _draw_sync_detail_column_separators(
+            sync_detail_header_frame,
+            col_widths,
+            header_height,
+        )
+
+    def _render_detail_empty_state(message_title, message_body):
+        empty_shell = tk.Frame(
+            sync_detail_body_frame,
+            bg=SYNC_CARD_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        empty_shell.pack(fill="both", expand=True)
+
+        tk.Label(
+            empty_shell,
+            text=message_title,
+            font=app._font(11, "bold"),
+            fg=SYNC_TEXT_TITLE,
+            bg=SYNC_CARD_BG,
+            anchor="center",
+            justify="center",
+        ).place(relx=0.5, rely=0.45, anchor="center")
+
+        if message_body:
+            tk.Label(
+                empty_shell,
+                text=message_body,
+                font=app._font(10),
+                fg=SYNC_TEXT_LABEL,
+                bg=SYNC_CARD_BG,
+                anchor="center",
+                justify="center",
+            ).place(relx=0.5, rely=0.57, anchor="center")
+
+    def _resolve_detail_view_state(filtered_items):
+        operation_name = str(runtime.get("operation") or "")
+
+        if runtime.get("busy") and operation_name == "scan":
+            return SYNC_DETAIL_STATE_SCANNING
+
+        if runtime.get("busy") and operation_name == "auto_sync":
+            return SYNC_DETAIL_STATE_SYNCING
+
+        snapshot = runtime.get("latest_snapshot") or {}
+        has_scanned = bool(snapshot.get("has_scanned"))
+        items = list(snapshot.get("detail_items") or [])
+
+        if not has_scanned:
+            return SYNC_DETAIL_STATE_NOT_SCANNED
+
+        if len(items) == 0:
+            return SYNC_DETAIL_STATE_SCANNED_EMPTY
+
+        if len(filtered_items) == 0:
+            return SYNC_DETAIL_STATE_FILTER_EMPTY
+
+        return SYNC_DETAIL_STATE_ITEMS
+
+    def _render_sync_detail_rows(col_widths, row_height):
+        for child in sync_detail_body_frame.winfo_children():
+            child.destroy()
+
+        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
+        page_items = _get_sync_detail_page_items(filtered_items)
+        detail_state_key = _resolve_detail_view_state(filtered_items)
+
+        if detail_state_key == SYNC_DETAIL_STATE_NOT_SCANNED:
+            _render_detail_empty_state(
+                "워크스페이스 검사 후 세부 동기화 항목이 표시됩니다.",
+                "먼저 워크스페이스 검사를 실행해주세요.",
+            )
+            return
+
+        if detail_state_key == SYNC_DETAIL_STATE_SCANNING:
+            _render_detail_empty_state(
+                "워크스페이스 검사 결과를 확인하고 있습니다.",
+                "",
+            )
+            return
+
+        if detail_state_key == SYNC_DETAIL_STATE_SYNCING:
+            _render_detail_empty_state(
+                "자동 동기화를 적용하고 있습니다.",
+                "",
+            )
+            return
+
+        if detail_state_key == SYNC_DETAIL_STATE_SCANNED_EMPTY:
+            _render_detail_empty_state(
+                "확인이 필요한 동기화 항목이 없습니다.",
+                "현재 발견된 파일 불일치 또는 오류가 없습니다.",
+            )
+            return
+
+        if detail_state_key == SYNC_DETAIL_STATE_FILTER_EMPTY:
+            _render_detail_empty_state(
+                "선택한 상태의 동기화 항목이 없습니다.",
+                "",
+            )
+            return
+
+        row_font = app._font(10)
+        row_bold_font = app._font(10, "bold")
+
+        for row_slot in range(sync_detail_rows_per_page):
+            item = page_items[row_slot] if row_slot < len(page_items) else None
+            row_bg = colors.SURFACE_ALT
+
+            row_frame = tk.Frame(
+                sync_detail_body_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+                height=row_height,
+            )
+            row_frame.pack(fill="x")
+            row_frame.pack_propagate(False)
+            row_frame.grid_propagate(False)
+            _configure_sync_detail_columns(row_frame, col_widths)
+
+            if item is None:
+                _draw_sync_detail_column_separators(
+                    row_frame,
+                    col_widths,
+                    row_height,
+                )
+                tk.Frame(
+                    row_frame,
+                    bg=colors.BORDER,
+                    height=1,
+                    bd=0,
+                    highlightthickness=0,
+                ).place(relx=0.0, rely=1.0, relwidth=1.0, anchor="sw")
+                continue
+
+            item_id = str(item.get("item_id") or "")
+            status_key = str(item.get("status") or "error")
+
+            status_meta = _get_sync_detail_status_meta(status_key)
+            status_icon = sync_detail_icons.get(str(status_meta.get("icon") or "error.svg"))
+
+            status_cell = tk.Frame(
+                row_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            status_cell.grid(row=0, column=0, sticky="nsew")
+
+            status_group = tk.Frame(
+                status_cell,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            status_group.place(relx=0.5, rely=0.5, anchor="center")
+
+            if status_icon is not None:
+                status_icon_label = tk.Label(
+                    status_group,
+                    image=status_icon,
+                    bg=row_bg,
+                    anchor="center",
+                )
+                status_icon_label.image = status_icon
+                status_icon_label.pack(side="left")
+
+            status_label = tk.Label(
+                status_group,
+                text=str(status_meta.get("label") or "오류"),
+                font=row_bold_font,
+                fg=str(status_meta.get("text_color") or SYNC_TEXT_TITLE),
+                bg=row_bg,
+                anchor="w",
+                justify="left",
+            )
+            status_label.pack(side="left", padx=(6, 0))
+
+            filename_raw = str(item.get("filename") or "-")
+            path_raw = str(item.get("relative_path") or "-")
+            detail_raw = str(item.get("detail") or status_meta.get("detail_fallback") or "-")
+            size_text = _format_sync_detail_file_size(item.get("size_bytes"))
+
+            filename_text = _truncate_sync_detail_text(
+                filename_raw,
+                max(10, int(col_widths[1]) - 20),
+                row_bold_font,
+            )
+            path_text = _truncate_sync_detail_text(
+                path_raw,
+                max(10, int(col_widths[2]) - 20),
+                row_font,
+            )
+            detail_text = _truncate_sync_detail_text(
+                detail_raw,
+                max(10, int(col_widths[4]) - 10),
+                row_font,
+            )
+
+            filename_cell = tk.Frame(
+                row_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            filename_cell.grid(row=0, column=1, sticky="nsew")
+
+            filename_label = tk.Label(
+                filename_cell,
+                text=filename_text,
+                font=row_bold_font,
+                fg=SYNC_TEXT_VALUE,
+                bg=row_bg,
+                anchor="w",
+                justify="left",
+            )
+            filename_label.pack(side="left", padx=(10, 6), pady=(0, 0))
+
+            path_cell = tk.Frame(
+                row_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            path_cell.grid(row=0, column=2, sticky="nsew")
+
+            path_label = tk.Label(
+                path_cell,
+                text=path_text,
+                font=row_font,
+                fg=SYNC_TEXT_LABEL,
+                bg=row_bg,
+                anchor="w",
+                justify="left",
+            )
+            path_label.pack(side="left", padx=(10, 6), pady=(0, 0))
+
+            size_label = tk.Label(
+                row_frame,
+                text=size_text,
+                font=row_font,
+                fg=SYNC_TEXT_TITLE,
+                bg=row_bg,
+                anchor="center",
+                justify="center",
+            )
+            size_label.grid(row=0, column=3, sticky="nsew", padx=(4, 4))
+
+            detail_label = tk.Label(
+                row_frame,
+                text=detail_text,
+                font=row_font,
+                fg=str(status_meta.get("detail_color") or status_meta.get("text_color") or SYNC_TEXT_LABEL),
+                bg=row_bg,
+                anchor="center",
+                justify="center",
+            )
+            detail_label.grid(row=0, column=4, sticky="nsew", padx=(4, 4))
+
+            action_cell = tk.Frame(
+                row_frame,
+                bg=row_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            action_cell.grid(row=0, column=5, sticky="nsew")
+
+            if status_key == "registration_required":
+                action_button = _build_sync_detail_action_button(action_cell, item_id)
+                action_button.place(relx=0.5, rely=0.5, anchor="center")
+            else:
+                action_dash = tk.Label(
+                    action_cell,
+                    text="—",
+                    font=app._font(11, "bold"),
+                    fg=SYNC_TEXT_LABEL,
+                    bg=row_bg,
+                    anchor="center",
+                    justify="center",
+                )
+                action_dash.place(relx=0.5, rely=0.5, anchor="center")
+
+            _draw_sync_detail_column_separators(
+                row_frame,
+                col_widths,
+                row_height,
+            )
+
+            tk.Frame(
+                row_frame,
+                bg=colors.BORDER,
+                height=1,
+                bd=0,
+                highlightthickness=0,
+            ).place(relx=0.0, rely=1.0, relwidth=1.0, anchor="sw")
+
+    def _render_sync_detail_pagination(filtered_items):
+        for child in sync_detail_footer_frame.winfo_children():
+            child.destroy()
+
+        page_count = _get_sync_detail_page_count(filtered_items)
+        current_page = int(sync_detail_state["page_index"])
+
+        pager_shell = tk.Frame(
+            sync_detail_footer_frame,
+            bg=SYNC_CARD_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        pager_shell.place(relx=0.5, rely=0.5, anchor="center")
+
+        can_go_prev = current_page > 0
+        can_go_next = current_page < (page_count - 1)
+
+        first_btn = _build_sync_detail_pagination_icon_button(
+            pager_shell,
+            "far_before.svg",
+            enabled=can_go_prev,
+            command=lambda: _set_sync_detail_page(0),
+        )
+        first_btn.pack(side="left", padx=(0, 6))
+
+        prev_btn = _build_sync_detail_pagination_icon_button(
+            pager_shell,
+            "before.svg",
+            enabled=can_go_prev,
+            command=lambda: _set_sync_detail_page(current_page - 1),
+        )
+        prev_btn.pack(side="left", padx=(0, 8))
+
+        tk.Label(
+            pager_shell,
+            text=f"{current_page + 1} / {page_count}",
+            font=app._font(12),
+            fg=SYNC_TEXT_TITLE,
+            bg=SYNC_CARD_BG,
+            anchor="center",
+            justify="center",
+        ).pack(side="left", padx=(0, 8))
+
+        next_btn = _build_sync_detail_pagination_icon_button(
+            pager_shell,
+            "after.svg",
+            enabled=can_go_next,
+            command=lambda: _set_sync_detail_page(current_page + 1),
+        )
+        next_btn.pack(side="left", padx=(0, 6))
+
+        last_btn = _build_sync_detail_pagination_icon_button(
+            pager_shell,
+            "far_after.svg",
+            enabled=can_go_next,
+            command=lambda: _set_sync_detail_page(page_count - 1),
+        )
+        last_btn.pack(side="left")
+
+    def _refresh_sync_detail_view():
+        if not _is_widget_alive(sync_detail_table_shell):
+            return
+
+        snapshot = runtime.get("latest_snapshot") or {}
+        if "detail_items" in snapshot:
+            sync_detail_state["items"] = list(
+                snapshot.get("detail_items") or []
+            )
+
+        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
+        _clamp_sync_detail_page(filtered_items)
+
+        table_metrics = _get_sync_detail_table_metrics()
+        header_height = int(table_metrics["header_height"])
+        row_height = int(table_metrics["row_height"])
+        body_height = int(table_metrics["body_height"])
+        footer_height = int(table_metrics["footer_height"])
+
+        sync_detail_header_frame.configure(height=header_height)
+        sync_detail_body_frame.configure(height=body_height)
+        sync_detail_footer_frame.configure(height=footer_height)
+
+        available_width = max(780, int(sync_detail_table_shell.winfo_width()) - 4)
+        col_widths = _get_sync_detail_column_widths(available_width)
+
+        _draw_sync_detail_filter_button()
+        _render_sync_detail_header(col_widths, header_height)
+        _render_sync_detail_rows(col_widths, row_height)
+        _render_sync_detail_pagination(filtered_items)
+
+    def _schedule_sync_detail_refresh(_event=None):
+        refresh_job = sync_detail_state.get("refresh_job")
+        if refresh_job is not None:
+            return
+
+        def _run_refresh():
+            sync_detail_state["refresh_job"] = None
+            _refresh_sync_detail_view()
+
+        try:
+            sync_detail_state["refresh_job"] = app.root.after(16, _run_refresh)
+        except Exception:
+            sync_detail_state["refresh_job"] = None
+
+    def _on_filter_button_enter(_event=None):
+        sync_detail_state["filter_hovered"] = True
+        _draw_sync_detail_filter_button()
+
+    def _on_filter_button_leave(_event=None):
+        sync_detail_state["filter_hovered"] = False
+        _draw_sync_detail_filter_button()
 
     def _render_progress_block(message, processed, total):
         message_label = tk.Label(
@@ -1178,10 +3209,16 @@ def show_sync_workspace_screen(app):
         )
         message_label.pack(fill="x")
 
-        counter_text = (
-            f"{_format_grouped_number(processed, fallback='0')} / "
-            f"{_format_grouped_number(total, fallback='0')} 파일"
-        )
+        if int(total) > 0:
+            counter_text = (
+                f"{_format_grouped_number(processed, fallback='0')} / "
+                f"{_format_grouped_number(total, fallback='0')} 파일"
+            )
+        else:
+            counter_text = (
+                f"{_format_grouped_number(processed, fallback='0')} / "
+                "- 파일"
+            )
         counter_label = tk.Label(
             sync_card_content,
             text=counter_text,
@@ -1315,114 +3352,208 @@ def show_sync_workspace_screen(app):
                 justify="center",
             ).pack(anchor="center")
 
-    def _start_demo_scan():
-        _cancel_sync_card_job()
-        _cancel_loading_text_job()
-
-        if not SYNC_UI_DEMO_MODE:
+    def _start_workspace_scan():
+        operation = _begin_operation("scan")
+        if operation is None:
             return
 
-        scan_loading_base_text = "워크스페이스를 검사하고 있어요"
+        generation = operation["generation"]
+        workspace_id = operation["workspace_id"]
+        workspace_root = operation["workspace_root"]
 
         _set_sync_card_state(
             SYNC_CARD_STATE_SCANNING,
+            summary=dict((runtime.get("latest_snapshot") or {}).get("summary") or {}),
             processed=0,
-            total=SYNC_DEMO_SCAN_TOTAL_FILES,
-            message=f"{scan_loading_base_text}.",
+            total=0,
+            message="워크스페이스 파일을 검사하고 있어요.",
+            failure_message="",
         )
-        _start_loading_text_animation(scan_loading_base_text)
-        _tick_demo_scan()
 
-    def _tick_demo_scan():
-        if sync_demo.get("state") != SYNC_CARD_STATE_SCANNING:
+        _refresh_sync_detail_view()
+
+        service_instance = runtime.get("service")
+
+        def _worker():
+            try:
+                workflow = service_instance.reconcile_workspace(
+                    workspace_id,
+                    workspace_root,
+                    apply_changes=False,
+                    progress_callback=_worker_progress_callback(generation, "scan"),
+                )
+
+                persisted_check_at = _record_workspace_check_timestamp(
+                    workspace_id,
+                    _derive_workflow_check_timestamp(workflow),
+                )
+
+                _enqueue_worker_event(
+                    generation,
+                    "success",
+                    "scan",
+                    payload={
+                        "workflow": workflow,
+                        "persisted_check_at": persisted_check_at,
+                    },
+                )
+
+            except Exception as exc:
+                _enqueue_worker_event(
+                    generation,
+                    "failure",
+                    "scan",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as exc:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message=f"{type(exc).__name__}: {exc}",
+            )
+            _finish_operation(generation)
+
+    def _start_auto_sync():
+        if runtime["busy"]:
             return
 
-        total = max(1, int(sync_demo.get("total") or SYNC_DEMO_SCAN_TOTAL_FILES))
-        processed = int(sync_demo.get("processed") or 0)
-        step = max(1, total // 38)
-        processed = min(total, processed + step)
-
-        _set_sync_card_state(
-            SYNC_CARD_STATE_SCANNING,
-            processed=processed,
-            total=total,
-        )
-
-        if processed >= total:
-            sync_demo["job"] = app.root.after(
-                260,
-                lambda: _set_sync_card_state(
-                    SYNC_CARD_STATE_RESULT,
-                    summary=SYNC_DEMO_SUMMARY_AFTER_SCAN,
-                ),
+        latest_scan_report = runtime.get("latest_scan_report")
+        if not isinstance(latest_scan_report, dict):
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message="자동 동기화를 실행하기 전에 워크스페이스 검사를 먼저 완료해주세요.",
             )
             return
 
-        sync_demo["job"] = app.root.after(
-            SYNC_DEMO_SCAN_TICK_MS,
-            _tick_demo_scan,
-        )
-
-    def _start_demo_sync():
-        _cancel_sync_card_job()
-        _cancel_loading_text_job()
-
-        if not SYNC_UI_DEMO_MODE:
-            return
-
-        summary = dict(sync_demo.get("summary") or SYNC_DEMO_SUMMARY_AFTER_SCAN)
-        total = max(0, int(summary.get("registration_required", 0)))
-        sync_loading_base_text = "데이터베이스를 동기화하고 있어요"
-
-        _set_sync_card_state(
-            SYNC_CARD_STATE_SYNCING,
-            processed=0,
-            total=total,
-            message=f"{sync_loading_base_text}.",
-        )
-        _start_loading_text_animation(sync_loading_base_text)
-        _tick_demo_sync()
-
-    def _tick_demo_sync():
-        if sync_demo.get("state") != SYNC_CARD_STATE_SYNCING:
-            return
-
-        total = max(1, int(sync_demo.get("total") or 1))
-        processed = int(sync_demo.get("processed") or 0)
-
-        if total <= 15:
-            step = 1
-        else:
-            step = max(1, total // 15)
-
-        processed = min(total, processed + step)
-
-        _set_sync_card_state(
-            SYNC_CARD_STATE_SYNCING,
-            processed=processed,
-            total=total,
-        )
-
-        if processed >= total:
-            sync_demo["job"] = app.root.after(
-                260,
-                lambda: _set_sync_card_state(
-                    SYNC_CARD_STATE_COMPLETE,
-                    summary=SYNC_DEMO_SUMMARY_AFTER_SYNC,
-                ),
+        summary = dict((runtime.get("latest_snapshot") or {}).get("summary") or {})
+        registration_required = int(summary.get("registration_required") or 0)
+        if registration_required <= 0:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_RESULT,
+                summary=summary,
+                failure_message="",
             )
             return
 
-        sync_demo["job"] = app.root.after(
-            SYNC_DEMO_SYNC_TICK_MS,
-            _tick_demo_sync,
+        acting_user = _current_authenticated_user()
+        if not acting_user:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message="현재 로그인 사용자 정보를 확인할 수 없어 동기화 적용을 진행할 수 없습니다.",
+            )
+            return
+
+        operation = _begin_operation("auto_sync")
+        if operation is None:
+            return
+
+        generation = operation["generation"]
+        workspace_id = operation["workspace_id"]
+        workspace_root = operation["workspace_root"]
+
+        _set_sync_card_state(
+            SYNC_CARD_STATE_SYNCING,
+            summary=summary,
+            processed=0,
+            total=registration_required,
+            message="데이터베이스를 동기화하고 있어요.",
+            failure_message="",
         )
+
+        _refresh_sync_detail_view()
+
+        service_instance = runtime.get("service")
+
+        def _worker():
+            try:
+                workflow = service_instance.apply_from_scan_report(
+                    workspace_id,
+                    workspace_root,
+                    dict(latest_scan_report),
+                    acting_user=acting_user,
+                    progress_callback=_worker_progress_callback(generation, "auto_sync"),
+                )
+
+                apply_result = workflow.get("apply_result") or {}
+                inserted_count = int(apply_result.get("inserted_count") or 0)
+                failed_count = int(apply_result.get("failed_count") or 0)
+
+                verified_sync_success = _is_verified_sync_success(
+                    workflow
+                )
+
+                verification_scan = _get_verification_scan_from_workflow(
+                    workflow
+                )
+
+                if verified_sync_success:
+                    persisted_state = _record_workspace_sync_timestamps(
+                        workspace_id,
+                        sync_timestamp=_derive_workflow_sync_timestamp(workflow),
+                        check_timestamp=_derive_workflow_check_timestamp(workflow),
+                    )
+                else:
+                    persisted_check_at = None
+
+                    if isinstance(verification_scan, dict):
+                        persisted_check_at = _record_workspace_check_timestamp(
+                            workspace_id,
+                            _derive_workflow_check_timestamp(workflow),
+                        )
+
+                    persisted_state = _get_workspace_reconciliation_state(
+                        workspace_id,
+                    )
+
+                    if persisted_check_at is not None:
+                        persisted_state["last_check_at"] = persisted_check_at
+
+                persisted_state = {
+                    "last_check_at": persisted_state.get("last_check_at"),
+                    "last_sync_at": persisted_state.get("last_sync_at"),
+                }
+
+                _enqueue_worker_event(
+                    generation,
+                    "success",
+                    "auto_sync",
+                    payload={
+                        "workflow": workflow,
+                        "persisted_state": persisted_state,
+                        "verified_sync_success": verified_sync_success,
+                        "inserted_count": inserted_count,
+                        "failed_count": failed_count,
+                    },
+                )
+
+            except Exception as exc:
+                _enqueue_worker_event(
+                    generation,
+                    "failure",
+                    "auto_sync",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as exc:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_FAILED,
+                failure_message=f"{type(exc).__name__}: {exc}",
+            )
+            _finish_operation(generation)
 
     def _render_sync_card():
         for child in sync_card_content.winfo_children():
             child.destroy()
 
-        state_name = sync_demo.get("state")
+        state_name = sync_card_state.get("state")
+        latest_snapshot = runtime.get("latest_snapshot") or {}
+        summary = dict(latest_snapshot.get("summary") or sync_card_state.get("summary") or {})
 
         if state_name == SYNC_CARD_STATE_INITIAL:
             initial_shell = tk.Frame(
@@ -1463,124 +3594,95 @@ def show_sync_workspace_screen(app):
             )
             button_zone.pack(fill="both", expand=True)
 
-            app.scan_button = _create_sync_icon_button(
+            scan_button = _create_sync_icon_button(
                 app,
                 button_zone,
                 text="워크스페이스 검사",
                 icon_name="scan.svg",
-                command=_start_demo_scan,
+                command=_start_workspace_scan,
                 primary=True,
-                enabled=True,
+                enabled=(not runtime["busy"]),
                 width=sync_action_button_width,
                 height=48,
             )
-            app.scan_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(22, 0))
+            scan_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(22, 0))
+            app.scan_button = scan_button
             app.sync_button = None
             return
 
         if state_name == SYNC_CARD_STATE_SCANNING:
             _render_progress_block(
-                sync_demo.get("message") or "워크스페이스를 검사하고 있어요…",
-                int(sync_demo.get("processed") or 0),
-                int(sync_demo.get("total") or SYNC_DEMO_SCAN_TOTAL_FILES),
+                sync_card_state.get("message") or "워크스페이스 파일을 검사하고 있어요.",
+                int(sync_card_state.get("processed") or 0),
+                int(sync_card_state.get("total") or 0),
             )
             app.scan_button = None
             app.sync_button = None
             return
 
-        if state_name == SYNC_CARD_STATE_RESULT:
-            summary = dict(sync_demo.get("summary") or SYNC_DEMO_SUMMARY_AFTER_SCAN)
-            _render_summary_area(summary)
+        if state_name == SYNC_CARD_STATE_SYNCING:
+            _render_progress_block(
+                sync_card_state.get("message") or "데이터베이스를 동기화하고 있어요.",
+                int(sync_card_state.get("processed") or 0),
+                int(sync_card_state.get("total") or 0),
+            )
+            app.scan_button = None
+            app.sync_button = None
+            return
 
-            registration_required = int(summary.get("registration_required", 0))
-            tk.Label(
-                sync_card_content,
-                text=f"{_format_grouped_number(registration_required, fallback='0')}개 파일을 DMS 데이터베이스에 등록할 수 있어요.",
-                font=app._font(11, "bold"),
-                fg=SYNC_TEXT_TITLE,
-                bg=SYNC_CARD_BG,
-                anchor="w",
-                justify="left",
-                wraplength=520,
-            ).pack(fill="x", pady=(10, 0))
-
-            helper_row = tk.Frame(
+        if state_name == SYNC_CARD_STATE_FAILED:
+            failure_shell = tk.Frame(
                 sync_card_content,
                 bg=SYNC_CARD_BG,
                 highlightthickness=0,
                 bd=0,
             )
-            helper_row.pack(fill="x", pady=(2, 0))
-
-            if question_mark_icon is not None:
-                helper_icon = tk.Label(
-                    helper_row,
-                    image=question_mark_icon,
-                    bg=SYNC_CARD_BG,
-                    anchor="n",
-                )
-                helper_icon.image = question_mark_icon
-                helper_icon.pack(side="left", padx=(0, 6), pady=(2, 0))
+            failure_shell.pack(fill="both", expand=True)
 
             tk.Label(
-                helper_row,
-                text=(
-                    "자동 동기화란 NAS에 존재하지만 DMS에 등록되지 않은 파일 정보를\n"
-                    "DMS 데이터베이스에 추가하는 작업이에요."
-                ),
+                failure_shell,
+                text="워크스페이스 검사에 실패했어요.",
+                font=app._font(11, "bold"),
+                fg=SYNC_STATUS_ERROR,
+                bg=SYNC_CARD_BG,
+                anchor="w",
+            ).pack(fill="x")
+
+            tk.Label(
+                failure_shell,
+                text=str(sync_card_state.get("failure_message") or "작업 중 오류가 발생했습니다."),
                 font=app._font(10),
                 fg=SYNC_TEXT_LABEL,
                 bg=SYNC_CARD_BG,
                 anchor="w",
                 justify="left",
-                wraplength=500,
-            ).pack(side="left", fill="x", expand=True)
+                wraplength=520,
+            ).pack(fill="x", pady=(6, 0))
 
-            if registration_required > 0:
-                app.sync_button = _create_sync_icon_button(
-                    app,
-                    sync_card_content,
-                    text="자동 동기화 적용",
-                    icon_name="sync.svg",
-                    command=_start_demo_sync,
-                    primary=True,
-                    enabled=True,
-                    width=sync_action_button_width,
-                    height=48,
-                )
-                app.sync_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(8, 0))
-                app.scan_button = None
-            else:
-                app.scan_button = _create_sync_icon_button(
-                    app,
-                    sync_card_content,
-                    text="다시 검사",
-                    icon_name="scan.svg",
-                    command=_start_demo_scan,
-                    primary=True,
-                    enabled=True,
-                    width=sync_action_button_width,
-                    height=48,
-                )
-                app.scan_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(8, 0))
-                app.sync_button = None
-            return
-
-        if state_name == SYNC_CARD_STATE_SYNCING:
-            _render_progress_block(
-                sync_demo.get("message") or "데이터베이스를 동기화하고 있어요…",
-                int(sync_demo.get("processed") or 0),
-                int(sync_demo.get("total") or 1),
+            scan_button = _create_sync_icon_button(
+                app,
+                failure_shell,
+                text="다시 검사",
+                icon_name="scan.svg",
+                command=_start_workspace_scan,
+                primary=True,
+                enabled=(not runtime["busy"]),
+                width=sync_action_button_width,
+                height=48,
             )
-            app.scan_button = None
+            scan_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(12, 0))
+            app.scan_button = scan_button
             app.sync_button = None
             return
 
-        if state_name == SYNC_CARD_STATE_COMPLETE:
-            summary = dict(sync_demo.get("summary") or SYNC_DEMO_SUMMARY_AFTER_SYNC)
-            _render_summary_area(summary)
+        _render_summary_area(summary)
 
-            synced_count = int(SYNC_DEMO_SUMMARY_AFTER_SCAN.get("registration_required", 0))
+        registration_required = int(summary.get("registration_required", 0))
+        review_required = int(summary.get("review_required", 0))
+        error_count = int(summary.get("error", 0))
+
+        if state_name == SYNC_CARD_STATE_COMPLETE:
+            inserted_count = int(runtime.get("last_apply_inserted_count") or 0)
             tk.Label(
                 sync_card_content,
                 text="동기화가 완료되었어요.",
@@ -1592,7 +3694,7 @@ def show_sync_workspace_screen(app):
 
             tk.Label(
                 sync_card_content,
-                text=f"{_format_grouped_number(synced_count, fallback='0')}개의 파일 정보를 DMS 데이터베이스에 등록했어요.",
+                text=f"{_format_grouped_number(inserted_count, fallback='0')}개의 파일 정보를 DMS 데이터베이스에 등록했어요.",
                 font=app._font(10),
                 fg=SYNC_TEXT_LABEL,
                 bg=SYNC_CARD_BG,
@@ -1601,1278 +3703,116 @@ def show_sync_workspace_screen(app):
                 wraplength=520,
             ).pack(fill="x", pady=(4, 0))
 
-            app.scan_button = _create_sync_icon_button(
+            scan_button = _create_sync_icon_button(
                 app,
                 sync_card_content,
                 text="다시 검사",
                 icon_name="scan.svg",
-                command=_start_demo_scan,
+                command=_start_workspace_scan,
+                primary=True,
+                enabled=(not runtime["busy"]),
+                width=sync_action_button_width,
+                height=48,
+            )
+            scan_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(14, 0))
+            app.scan_button = scan_button
+            app.sync_button = None
+            return
+
+        tk.Label(
+            sync_card_content,
+            text=f"{_format_grouped_number(registration_required, fallback='0')}개 파일을 DMS 데이터베이스에 등록할 수 있어요.",
+            font=app._font(11, "bold"),
+            fg=SYNC_TEXT_TITLE,
+            bg=SYNC_CARD_BG,
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        ).pack(fill="x", pady=(10, 0))
+
+        helper_row = tk.Frame(
+            sync_card_content,
+            bg=SYNC_CARD_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        helper_row.pack(fill="x", pady=(2, 0))
+
+        if question_mark_icon is not None:
+            helper_icon = tk.Label(
+                helper_row,
+                image=question_mark_icon,
+                bg=SYNC_CARD_BG,
+                anchor="n",
+            )
+            helper_icon.image = question_mark_icon
+            helper_icon.pack(side="left", padx=(0, 6), pady=(2, 0))
+
+        tk.Label(
+            helper_row,
+            text=(
+                "자동 동기화란 NAS에 존재하지만 DMS에 등록되지 않은 파일 정보를\n"
+                "DMS 데이터베이스에 추가하는 작업이에요."
+            ),
+            font=app._font(10),
+            fg=SYNC_TEXT_LABEL,
+            bg=SYNC_CARD_BG,
+            anchor="w",
+            justify="left",
+            wraplength=500,
+        ).pack(side="left", fill="x", expand=True)
+
+        can_auto_sync = (
+            (registration_required > 0)
+            and (review_required >= 0)
+            and (error_count >= 0)
+            and (not runtime["busy"])
+            and isinstance(runtime.get("latest_scan_report"), dict)
+        )
+
+        if can_auto_sync:
+            sync_button = _create_sync_icon_button(
+                app,
+                sync_card_content,
+                text="자동 동기화 적용",
+                icon_name="sync.svg",
+                command=_start_auto_sync,
                 primary=True,
                 enabled=True,
                 width=sync_action_button_width,
                 height=48,
             )
-            app.scan_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(14, 0))
-            app.sync_button = None
-            return
-
-    app.sync_card_demo = {
-        "set_state": _set_sync_card_state,
-        "start_demo_scan": _start_demo_scan,
-        "start_demo_sync": _start_demo_sync,
-        "cancel_job": _cancel_sync_card_job,
-    }
-
-    _set_sync_card_state(SYNC_CARD_STATE_INITIAL)
-
-    result_card_canvas, result_card = _create_rounded_card(app, page, radius=16)
-    result_card_canvas.grid(row=1, column=0, sticky="nsew")
-
-    detail_title_row = tk.Frame(
-        result_card,
-        bg=SYNC_CARD_BG,
-        highlightthickness=0,
-        bd=0,
-    )
-    detail_title_row.pack(fill="x")
-
-    tk.Label(
-        detail_title_row,
-        text="세부 동기화 항목",
-        font=app._font(13, "bold"),
-        fg=SYNC_TEXT_TITLE,
-        bg=SYNC_CARD_BG,
-        anchor="w",
-    ).pack(side="left")
-
-    sync_detail_filter_button = tk.Canvas(
-        detail_title_row,
-        width=103,
-        height=34,
-        bg=SYNC_CARD_BG,
-        highlightthickness=0,
-        bd=0,
-        cursor="hand2",
-    )
-    sync_detail_filter_button.pack(side="right")
-
-    detail_card_content = tk.Frame(
-        result_card,
-        bg=SYNC_CARD_BG,
-        highlightthickness=0,
-        bd=0,
-    )
-    detail_card_content.pack(fill="both", expand=True, pady=(8, 4))
-
-    sync_detail_rows_per_page = 4
-    sync_detail_row_height = 38
-    sync_detail_header_height = 21
-    sync_detail_footer_height = 30
-    sync_detail_col_ratios = [1.4, 2.2, 2.4, 0.8, 3.0, 1.0]
-    sync_detail_col_headers = ["상태", "파일명", "위치", "크기", "상세", "작업"]
-    sync_detail_body_height = sync_detail_rows_per_page * sync_detail_row_height
-    sync_detail_table_min_height = (
-        sync_detail_header_height
-        + sync_detail_body_height
-        + sync_detail_footer_height
-    )
-
-    sync_detail_status_meta = {
-        "normal": {
-            "label": "정상",
-            "detail_fallback": "-",
-            "text_color": colors.SUCCESS_STRONG,
-            "detail_color": colors.SUCCESS_STRONG,
-            "icon": "normal_small.svg",
-        },
-        "registration_required": {
-            "label": "등록 필요",
-            "detail_fallback": "DMS 미등록 파일",
-            "text_color": colors.PRIMARY,
-            "detail_color": colors.PRIMARY,
-            "icon": "new_small.svg",
-        },
-        "review_required": {
-            "label": "확인 필요",
-            "detail_fallback": "NAS에서 파일을 찾을 수 없음",
-            "text_color": colors.ALERT,
-            "detail_color": colors.ALERT,
-            "icon": "alert_small.svg",
-        },
-        "error": {
-            "label": "오류",
-            "detail_fallback": "파일 정보를 읽을 수 없음",
-            "text_color": colors.FAILED_STRONG,
-            "detail_color": colors.FAILED_STRONG,
-            "icon": "error_small.svg",
-        },
-    }
-
-    sync_detail_filter_options = [
-        ("all", "모두 보기"),
-        ("registration_required", "등록 필요"),
-        ("review_required", "확인 필요"),
-        ("error", "오류"),
-    ]
-    sync_detail_filter_label_to_key = {
-        label: key
-        for key, label in sync_detail_filter_options
-    }
-
-    sync_detail_icons = {}
-    for icon_name in (
-        "normal_small.svg",
-        "new_small.svg",
-        "alert_small.svg",
-        "error_small.svg",
-        "filter.svg",
-        "expand.svg",
-        "collapse.svg",
-        "far_before.svg",
-        "before.svg",
-        "after.svg",
-        "far_after.svg",
-    ):
-        icon_path = SYNC_STATUS_ICON_DIR / icon_name
-        icon_w, icon_h = _read_svg_intrinsic_size(icon_path)
-        sync_detail_icons[icon_name] = load_svg_photo(
-            icon_path,
-            max_width=icon_w,
-            max_height=icon_h,
-        )
-
-    sync_detail_table_shell = tk.Frame(
-        detail_card_content,
-        bg=SYNC_CARD_BG,
-        highlightthickness=1,
-        highlightbackground=colors.BORDER,
-        highlightcolor=colors.BORDER,
-        bd=0,
-        height=sync_detail_table_min_height,
-    )
-    sync_detail_table_shell.pack(fill="both", expand=True, anchor="n")
-    sync_detail_table_shell.pack_propagate(False)
-
-    sync_detail_header_frame = tk.Frame(
-        sync_detail_table_shell,
-        bg=colors.SURFACE_ACCENT_SOFT,
-        highlightthickness=0,
-        bd=0,
-        height=sync_detail_header_height,
-    )
-    sync_detail_header_frame.pack(side="top", fill="x")
-    sync_detail_header_frame.pack_propagate(False)
-    sync_detail_header_frame.grid_propagate(False)
-
-    sync_detail_body_frame = tk.Frame(
-        sync_detail_table_shell,
-        bg=SYNC_CARD_BG,
-        highlightthickness=0,
-        bd=0,
-        height=sync_detail_body_height,
-    )
-    sync_detail_body_frame.pack(side="top", fill="x")
-    sync_detail_body_frame.pack_propagate(False)
-
-    sync_detail_footer_frame = tk.Frame(
-        sync_detail_table_shell,
-        bg=SYNC_CARD_BG,
-        highlightthickness=0,
-        bd=0,
-        height=sync_detail_footer_height,
-    )
-    sync_detail_footer_frame.pack(side="top", fill="x")
-    sync_detail_footer_frame.pack_propagate(False)
-
-    sync_detail_state = {
-        "items": [],
-        "filter_key": "all",
-        "page_index": 0,
-        "rows_per_page": sync_detail_rows_per_page,
-        "filter_popup": None,
-        "filter_popup_open": False,
-        "filter_hovered": False,
-        "filter_display_label": "모두 보기",
-        "action_states": {},
-        "action_jobs": {},
-        "refresh_job": None,
-    }
-
-    def _get_demo_sync_detail_items():
-        return [
-            {
-                "item_id": "r001",
-                "status": "registration_required",
-                "filename": "invoice_023.pdf",
-                "relative_path": "/2024/회계/invoice_023.pdf",
-                "size_bytes": 2411724,
-                "detail": "DMS 미등록 파일",
-                "record_id": None,
-            },
-            {
-                "item_id": "r002",
-                "status": "registration_required",
-                "filename": "2026_상반기_재무보고서.pdf",
-                "relative_path": "/재무/보고서/2026/2026_상반기_재무보고서.pdf",
-                "size_bytes": 19608371,
-                "detail": "DMS 미등록 파일",
-                "record_id": None,
-            },
-            {
-                "item_id": "r003",
-                "status": "registration_required",
-                "filename": "ultra_long_vendor_invoice_bundle_reference_2026_revision_candidate_final_signed_copy.pdf",
-                "relative_path": "/재무/정산/2026/Q3/보관/원본/ultra_long_vendor_invoice_bundle_reference_2026_revision_candidate_final_signed_copy.pdf",
-                "size_bytes": 45312789,
-                "detail": "DMS 미등록 파일",
-                "record_id": None,
-            },
-            {
-                "item_id": "r004",
-                "status": "review_required",
-                "filename": "contract.pdf",
-                "relative_path": "/계약/contract.pdf",
-                "size_bytes": 35651584,
-                "detail": "등록된 경로에서 파일을 찾을 수 없음",
-                "record_id": 821,
-            },
-            {
-                "item_id": "r005",
-                "status": "review_required",
-                "filename": "거래처_목록.xlsx",
-                "relative_path": "/영업/거래처/거래처_목록.xlsx",
-                "size_bytes": 962560,
-                "detail": "등록된 상위 폴더가 NAS에 존재하지 않음",
-                "record_id": 944,
-            },
-            {
-                "item_id": "r006",
-                "status": "review_required",
-                "filename": "archive_policy_v2.docx",
-                "relative_path": "/정책/archive_policy_v2.docx",
-                "size_bytes": 2288654,
-                "detail": "전체 검사 후 NAS 파일 미확인",
-                "record_id": 1408,
-            },
-            {
-                "item_id": "r007",
-                "status": "review_required",
-                "filename": "project_plan_ko_en_mix_장기전략문서_최종검토본.pptx",
-                "relative_path": "/전략/중장기/2026/회의자료/project_plan_ko_en_mix_장기전략문서_최종검토본.pptx",
-                "size_bytes": 46860972,
-                "detail": "DB 기록만 존재하고 NAS 파일은 확인되지 않음",
-                "record_id": 1454,
-            },
-            {
-                "item_id": "r008",
-                "status": "review_required",
-                "filename": "deleted_on_nas_but_in_db.txt",
-                "relative_path": "/운영/로그/deleted_on_nas_but_in_db.txt",
-                "size_bytes": 212992,
-                "detail": "등록된 NAS 경로가 존재하지 않음",
-                "record_id": 1601,
-            },
-            {
-                "item_id": "r009",
-                "status": "error",
-                "filename": "permission_denied_budget.xlsx",
-                "relative_path": "/재무/기밀/permission_denied_budget.xlsx",
-                "size_bytes": 7144823,
-                "detail": "파일 접근 권한 없음",
-                "record_id": None,
-            },
-            {
-                "item_id": "r010",
-                "status": "error",
-                "filename": "unreadable_media.mov",
-                "relative_path": "/영상/원본/unreadable_media.mov",
-                "size_bytes": 329069502,
-                "detail": "파일 정보를 읽을 수 없음",
-                "record_id": None,
-            },
-            {
-                "item_id": "r011",
-                "status": "error",
-                "filename": "broken_record.docx",
-                "relative_path": "/문서/broken_record.docx",
-                "size_bytes": 1468006,
-                "detail": "잘못된 파일 경로",
-                "record_id": None,
-            },
-            {
-                "item_id": "r012",
-                "status": "error",
-                "filename": "path_mismatch_문서.txt",
-                "relative_path": "/문서/path_mismatch_문서.txt",
-                "size_bytes": 121944,
-                "detail": "워크스페이스 경로 불일치",
-                "record_id": 1520,
-            },
-            {
-                "item_id": "r013",
-                "status": "error",
-                "filename": "duplicate_contract_pointer.pdf",
-                "relative_path": "/계약/중복/duplicate_contract_pointer.pdf",
-                "size_bytes": 1042048,
-                "detail": "중복된 DMS 경로 기록",
-                "record_id": 1201,
-            },
-        ]
-
-    sync_detail_state["items"] = _get_demo_sync_detail_items()
-
-    def _format_sync_detail_file_size(size_bytes):
-        if size_bytes is None:
-            return "-"
-
-        try:
-            size_value = float(size_bytes)
-        except (TypeError, ValueError):
-            return "-"
-
-        units = ("B", "KB", "MB", "GB", "TB")
-        unit_index = 0
-
-        while size_value >= 1024.0 and unit_index < len(units) - 1:
-            size_value /= 1024.0
-            unit_index += 1
-
-        if unit_index == 0:
-            return f"{int(size_value)} {units[unit_index]}"
-        if size_value >= 100:
-            return f"{size_value:.0f} {units[unit_index]}"
-        if size_value >= 10:
-            return f"{size_value:.1f} {units[unit_index]}"
-        return f"{size_value:.2f} {units[unit_index]}"
-
-    def _truncate_sync_detail_text(text, max_width_px, font_spec):
-        value = str(text or "")
-        if max_width_px <= 0 or not value:
-            return ""
-
-        font_obj = tkfont.Font(root=app.root, font=font_spec)
-        if font_obj.measure(value) <= max_width_px:
-            return value
-
-        ellipsis = "…"
-        ellipsis_width = font_obj.measure(ellipsis)
-        if ellipsis_width >= max_width_px:
-            return ""
-
-        lo, hi = 0, len(value)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            candidate = value[:mid].rstrip() + ellipsis
-            if font_obj.measure(candidate) <= max_width_px:
-                lo = mid
-            else:
-                hi = mid - 1
-
-        return value[:lo].rstrip() + ellipsis
-
-    def _get_sync_detail_column_widths(total_width):
-        width = max(780, int(total_width))
-        ratio_total = sum(sync_detail_col_ratios) or 1
-        col_widths = [
-            int(width * (ratio / ratio_total))
-            for ratio in sync_detail_col_ratios
-        ]
-        col_widths[-1] += max(0, width - sum(col_widths))
-        return col_widths
-
-    def _get_sync_detail_table_metrics():
-        table_height = int(sync_detail_table_shell.winfo_height())
-        if table_height <= 1:
-            table_height = int(sync_detail_table_min_height)
-
-        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
-        header_height = max(18, int(sync_detail_header_height))
-        row_height = max(24, int(sync_detail_row_height))
-        body_height = row_height * rows_per_page
-        footer_height = int(table_height - header_height - body_height)
-
-        if footer_height < 12:
-            needed = 12 - footer_height
-            header_reducible = max(0, header_height - 18)
-            take = min(needed, header_reducible)
-            header_height -= take
-            needed -= take
-
-            if needed > 0:
-                shrink_rows = int((needed + rows_per_page - 1) // rows_per_page)
-                row_height = max(24, row_height - shrink_rows)
-                body_height = row_height * rows_per_page
-
-            footer_height = max(12, int(table_height - header_height - body_height))
-
-        return {
-            "table_height": max(1, int(table_height)),
-            "header_height": max(1, int(header_height)),
-            "row_height": max(1, int(row_height)),
-            "body_height": max(1, int(body_height)),
-            "footer_height": max(1, int(footer_height)),
-        }
-
-    def _configure_sync_detail_columns(frame, col_widths):
-        frame.grid_rowconfigure(0, weight=1)
-        for idx, col_width in enumerate(col_widths):
-            frame.grid_columnconfigure(
-                idx,
-                minsize=max(40, int(col_width)),
-                weight=0,
-            )
-
-    def _draw_sync_detail_column_separators(parent, col_widths, height_px):
-        # Card No.3 refinement: hide vertical column demarcation lines.
-        return
-
-        for child in parent.place_slaves():
-            if getattr(child, "_sync_detail_col_sep", False):
-                child.destroy()
-
-        x_cursor = 0
-        draw_height = max(1, int(height_px))
-
-        for col_width in col_widths[:-1]:
-            x_cursor += int(col_width)
-            separator = tk.Frame(
-                parent,
-                bg=colors.BORDER,
-                highlightthickness=0,
-                bd=0,
-            )
-            separator._sync_detail_col_sep = True
-            separator.place(
-                x=max(0, x_cursor),
-                y=0,
-                width=1,
-                height=draw_height,
-            )
-
-    def _get_sync_detail_status_meta(status_key):
-        return sync_detail_status_meta.get(
-            status_key,
-            sync_detail_status_meta["error"],
-        )
-
-    def _apply_sync_detail_filter(items):
-        filter_key = str(sync_detail_state.get("filter_key") or "all")
-        if filter_key == "all":
-            return list(items)
-
-        return [
-            item
-            for item in items
-            if str(item.get("status")) == filter_key
-        ]
-
-    def _get_sync_detail_page_count(filtered_items):
-        total_count = len(filtered_items)
-        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
-        return max(1, (total_count + rows_per_page - 1) // rows_per_page)
-
-    def _clamp_sync_detail_page(filtered_items):
-        page_count = _get_sync_detail_page_count(filtered_items)
-        sync_detail_state["page_index"] = max(
-            0,
-            min(
-                int(sync_detail_state["page_index"]),
-                page_count - 1,
-            ),
-        )
-
-    def _get_sync_detail_page_items(filtered_items):
-        _clamp_sync_detail_page(filtered_items)
-        rows_per_page = max(1, int(sync_detail_state["rows_per_page"]))
-        start_index = int(sync_detail_state["page_index"]) * rows_per_page
-        end_index = start_index + rows_per_page
-        return filtered_items[start_index:end_index]
-
-    def _is_sync_detail_widget_alive(widget):
-        try:
-            return bool(widget.winfo_exists())
-        except Exception:
-            return False
-
-    def _is_sync_detail_descendant(widget, ancestor):
-        current = widget
-        while current is not None:
-            if current == ancestor:
-                return True
-            try:
-                current = current.master
-            except Exception:
-                return False
-        return False
-
-    def _draw_sync_detail_filter_button():
-        if not _is_sync_detail_widget_alive(sync_detail_filter_button):
-            return
-
-        try:
-            sync_detail_filter_button.delete("all")
-        except Exception:
-            return
-
-        button_width = max(88, int(sync_detail_filter_button.winfo_width()))
-        button_height = max(30, int(sync_detail_filter_button.winfo_height()))
-
-        fill_color = colors.SURFACE_HOVER if sync_detail_state.get("filter_hovered") else colors.SURFACE_ALT
-        border_color = colors.BORDER
-
-        app._smooth_rounded_rect(
-            sync_detail_filter_button,
-            1,
-            1,
-            button_width - 1,
-            button_height - 1,
-            11,
-            fill=fill_color,
-            outline=border_color,
-            width=1,
-        )
-
-        filter_icon = sync_detail_icons.get("filter.svg")
-        if filter_icon is not None:
-            sync_detail_filter_button.create_image(
-                16,
-                button_height / 2.0,
-                image=filter_icon,
-                anchor="center",
-            )
-
-        sync_detail_filter_button.create_text(
-            30,
-            button_height / 2.0,
-            text=str(sync_detail_state.get("filter_display_label") or "모두 보기"),
-            fill=SYNC_TEXT_TITLE,
-            font=app._font(10, "bold"),
-            anchor="w",
-        )
-
-        expand_icon_key = "collapse.svg" if sync_detail_state.get("filter_popup_open") else "expand.svg"
-        expand_icon = sync_detail_icons.get(expand_icon_key)
-
-        if expand_icon is not None:
-            sync_detail_filter_button.create_image(
-                button_width - 16,
-                button_height / 2.0,
-                image=expand_icon,
-                anchor="center",
-            )
-
-    def _close_sync_detail_filter_popup(*, redraw=True):
-        popup = sync_detail_state.get("filter_popup")
-        if popup is not None:
-            try:
-                if popup.winfo_exists():
-                    popup.destroy()
-            except Exception:
-                pass
-
-        sync_detail_state["filter_popup"] = None
-        sync_detail_state["filter_popup_open"] = False
-        if redraw:
-            _draw_sync_detail_filter_button()
-
-    def _set_sync_detail_filter(filter_key):
-        sync_detail_state["filter_key"] = str(filter_key)
-        sync_detail_state["filter_display_label"] = next(
-            (
-                label
-                for key, label in sync_detail_filter_options
-                if key == filter_key
-            ),
-            "모두 보기",
-        )
-        sync_detail_state["page_index"] = 0
-        _close_sync_detail_filter_popup()
-        _refresh_sync_detail_view()
-
-    def _open_sync_detail_filter_popup():
-        if not _is_sync_detail_widget_alive(sync_detail_filter_button):
-            return
-
-        _close_sync_detail_filter_popup()
-
-        popup_width = max(120, int(sync_detail_filter_button.winfo_width()))
-        popup_rows = len(sync_detail_filter_options)
-        option_row_height = 32
-        popup_height = (popup_rows * option_row_height) + 12
-        popup_x = sync_detail_filter_button.winfo_rootx()
-        popup_y = sync_detail_filter_button.winfo_rooty() + sync_detail_filter_button.winfo_height() + 2
-
-        popup = tk.Toplevel(app.root)
-        popup.overrideredirect(True)
-        popup.transient(app.root)
-        popup.configure(bg=colors.SURFACE_ALT)
-        popup.geometry(f"{popup_width}x{popup_height}+{popup_x}+{popup_y}")
-        popup.lift()
-        popup.focus_force()
-
-        shell_canvas = tk.Canvas(
-            popup,
-            bg=colors.SURFACE_ALT,
-            highlightthickness=0,
-            bd=0,
-        )
-        shell_canvas.pack(fill="both", expand=True)
-
-        def _draw_popup_shell(width_value, height_value):
-            shell_canvas.delete("popup_shell_bg")
-            app._smooth_rounded_rect(
-                shell_canvas,
-                1,
-                1,
-                max(2, int(width_value) - 1),
-                max(2, int(height_value) - 1),
-                10,
-                fill=colors.SURFACE_ALT,
-                outline=colors.BORDER,
-                width=1,
-                tags="popup_shell_bg",
-            )
-            shell_canvas.tag_lower("popup_shell_bg")
-
-        _draw_popup_shell(popup_width, popup_height)
-
-        shell_canvas.bind(
-            "<Configure>",
-            lambda event: _draw_popup_shell(event.width, event.height),
-            add="+",
-        )
-
-        body = tk.Frame(
-            shell_canvas,
-            bg=colors.SURFACE_ALT,
-            bd=0,
-            highlightthickness=0,
-        )
-
-        shell_canvas.create_window(
-            2,
-            2,
-            anchor="nw",
-            window=body,
-            width=max(1, popup_width - 4),
-            height=max(1, popup_height - 4),
-        )
-
-        current_key = str(sync_detail_state.get("filter_key") or "all")
-
-        def _build_option_row(option_key, option_label):
-            row_shell = tk.Frame(
-                body,
-                bg=colors.SURFACE_ALT,
-                bd=0,
-                highlightthickness=0,
-                height=option_row_height,
-            )
-            row_shell.pack(fill="x")
-            row_shell.pack_propagate(False)
-
-            is_current = option_key == current_key
-            row_bg = colors.SURFACE_HOVER_SOFT if is_current else colors.SURFACE_ALT
-            row_text_color = colors.PRIMARY if is_current else SYNC_TEXT_TITLE
-
-            row_label = tk.Label(
-                row_shell,
-                text=option_label,
-                font=app._font(10, "bold") if is_current else app._font(10),
-                fg=row_text_color,
-                bg=row_bg,
-                anchor="w",
-                justify="left",
-                padx=10,
-            )
-            row_label.pack(fill="both", expand=True)
-
-            def _apply_row_bg(bg_color):
-                try:
-                    row_shell.configure(bg=bg_color)
-                except Exception:
-                    pass
-                try:
-                    row_label.configure(bg=bg_color)
-                except Exception:
-                    pass
-
-            def _on_row_enter(_event=None):
-                _apply_row_bg(colors.SURFACE_HOVER_SOFT)
-
-            def _on_row_leave(_event=None):
-                _apply_row_bg(row_bg)
-
-            def _on_row_click(_event=None):
-                _set_sync_detail_filter(option_key)
-                return "break"
-
-            for widget in (row_shell, row_label):
-                widget.bind("<Enter>", _on_row_enter, add="+")
-                widget.bind("<Leave>", _on_row_leave, add="+")
-                widget.bind("<Button-1>", _on_row_click, add="+")
-
-        for option_key, option_label in sync_detail_filter_options:
-            _build_option_row(option_key, option_label)
-
-        popup.bind("<Escape>", lambda _event: _close_sync_detail_filter_popup())
-
-        sync_detail_state["filter_popup"] = popup
-        sync_detail_state["filter_popup_open"] = True
-        _draw_sync_detail_filter_button()
-
-    def _toggle_sync_detail_filter_popup(_event=None):
-        if sync_detail_state.get("filter_popup_open"):
-            _close_sync_detail_filter_popup()
+            sync_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(8, 0))
+            app.sync_button = sync_button
+            app.scan_button = None
         else:
-            _open_sync_detail_filter_popup()
-        return "break"
-
-    def _build_sync_detail_action_button(parent, item_id):
-        button_canvas = tk.Canvas(
-            parent,
-            width=74,
-            height=30,
-            bg=parent.cget("bg"),
-            highlightthickness=0,
-            bd=0,
-            cursor="hand2",
-        )
-
-        button_state = {"hovered": False}
-
-        def _draw_button(hovered=False):
-            button_canvas.delete("all")
-
-            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
-            is_enabled = action_state == "idle"
-
-            if action_state == "done":
-                fill_color = colors.SURFACE_HOVER
-                border_color = colors.BORDER
-                text_color = colors.SUCCESS_STRONG
-                label_text = "완료"
-            elif action_state == "registering":
-                fill_color = colors.SURFACE_HOVER
-                border_color = colors.BORDER
-                text_color = SYNC_TEXT_LABEL
-                label_text = "등록 중…"
-            else:
-                fill_color = colors.SURFACE_HOVER_SOFT if hovered else colors.SURFACE_ALT
-                border_color = colors.PRIMARY
-                text_color = colors.PRIMARY
-                label_text = "등록"
-
-            app._smooth_rounded_rect(
-                button_canvas,
-                1,
-                1,
-                73,
-                29,
-                9,
-                fill=fill_color,
-                outline=border_color,
-                width=1,
+            scan_button = _create_sync_icon_button(
+                app,
+                sync_card_content,
+                text="다시 검사",
+                icon_name="scan.svg",
+                command=_start_workspace_scan,
+                primary=True,
+                enabled=(not runtime["busy"]),
+                width=sync_action_button_width,
+                height=48,
             )
+            scan_button.pack(fill="x", padx=sync_action_button_side_pad, pady=(8, 0))
+            app.scan_button = scan_button
+            app.sync_button = None
 
-            button_canvas.create_text(
-                37,
-                15,
-                text=label_text,
-                fill=text_color,
-                font=app._font(10, "bold"),
-                anchor="center",
-            )
-
-            button_canvas.configure(cursor="hand2" if is_enabled else "")
-
-        def _on_enter(_event=None):
-            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
-            if action_state != "idle":
-                return
-            button_state["hovered"] = True
-            _draw_button(hovered=True)
-
-        def _on_leave(_event=None):
-            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
-            if action_state != "idle":
-                return
-            button_state["hovered"] = False
-            _draw_button(hovered=False)
-
-        def _start_demo_register(_event=None):
-            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
-            if action_state != "idle":
-                return "break"
-
-            sync_detail_state["action_states"][item_id] = "registering"
-            _refresh_sync_detail_view()
-
-            def _finish_register():
-                sync_detail_state["action_jobs"].pop(item_id, None)
-                sync_detail_state["action_states"][item_id] = "done"
-                _refresh_sync_detail_view()
-
-            job_id = app.root.after(700, _finish_register)
-            sync_detail_state["action_jobs"][item_id] = job_id
-            return "break"
-
-        button_canvas.bind("<Enter>", _on_enter, add="+")
-        button_canvas.bind("<Leave>", _on_leave, add="+")
-        button_canvas.bind("<Button-1>", _start_demo_register, add="+")
-
-        _draw_button(hovered=False)
-        return button_canvas
-
-    def _build_sync_detail_pagination_icon_button(parent, icon_name, *, enabled, command):
-        button_canvas = tk.Canvas(
-            parent,
-            width=30,
-            height=28,
-            bg=parent.cget("bg"),
-            highlightthickness=0,
-            bd=0,
-            cursor="hand2" if enabled else "",
-        )
-        icon_photo = sync_detail_icons.get(icon_name)
-
-        def _draw_button():
-            button_canvas.delete("all")
-            if enabled:
-                fill_color = colors.SURFACE_ALT
-                border_color = colors.BORDER
-            else:
-                fill_color = colors.SURFACE_ALT
-                border_color = colors.SURFACE_ALT
-
-            app._smooth_rounded_rect(
-                button_canvas,
-                1,
-                1,
-                29,
-                27,
-                8,
-                fill=fill_color,
-                outline=border_color,
-                width=1,
-            )
-
-            if icon_photo is not None:
-                button_canvas.create_image(
-                    15,
-                    14,
-                    image=icon_photo,
-                    anchor="center",
-                )
-
-            button_canvas.configure(cursor="hand2" if enabled else "")
-
-        def _on_click(_event=None):
-            if not enabled:
-                return "break"
-            command()
-            return "break"
-
-        button_canvas.bind("<Button-1>", _on_click, add="+")
-
-        _draw_button()
-        return button_canvas
-
-    def _set_sync_detail_page(page_index):
-        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
-        page_count = _get_sync_detail_page_count(filtered_items)
-
-        sync_detail_state["page_index"] = max(
-            0,
-            min(int(page_index), page_count - 1),
-        )
+    def _refresh_workspace_sync_views():
+        _refresh_card1()
+        _render_sync_card()
         _refresh_sync_detail_view()
 
-    def _render_sync_detail_header(col_widths, header_height):
-        for child in sync_detail_header_frame.winfo_children():
-            child.destroy()
-
-        _configure_sync_detail_columns(sync_detail_header_frame, col_widths)
-
-        for col_idx, header_text in enumerate(sync_detail_col_headers):
-            tk.Label(
-                sync_detail_header_frame,
-                text=header_text,
-                font=app._font(10, "bold"),
-                fg=SYNC_TEXT_TITLE,
-                bg=colors.SURFACE_ACCENT_SOFT,
-                anchor="center",
-                justify="center",
-            ).grid(
-                row=0,
-                column=col_idx,
-                sticky="nsew",
-                padx=(4, 4),
-            )
-
-        _draw_sync_detail_column_separators(
-            sync_detail_header_frame,
-            col_widths,
-            header_height,
-        )
-
-    def _render_sync_detail_rows(col_widths, row_height):
-        for child in sync_detail_body_frame.winfo_children():
-            child.destroy()
-
-        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
-        page_items = _get_sync_detail_page_items(filtered_items)
-
-        if not filtered_items:
-            empty_shell = tk.Frame(
-                sync_detail_body_frame,
-                bg=SYNC_CARD_BG,
-                highlightthickness=0,
-                bd=0,
-            )
-            empty_shell.pack(fill="both", expand=True)
-
-            tk.Label(
-                empty_shell,
-                text="확인이 필요한 동기화 항목이 없습니다.",
-                font=app._font(11, "bold"),
-                fg=SYNC_TEXT_TITLE,
-                bg=SYNC_CARD_BG,
-                anchor="center",
-                justify="center",
-            ).place(relx=0.5, rely=0.45, anchor="center")
-
-            tk.Label(
-                empty_shell,
-                text="현재 발견된 파일 불일치 또는 오류가 없습니다.",
-                font=app._font(10),
-                fg=SYNC_TEXT_LABEL,
-                bg=SYNC_CARD_BG,
-                anchor="center",
-                justify="center",
-            ).place(relx=0.5, rely=0.57, anchor="center")
+    def _on_screen_destroy(_event=None):
+        if runtime["destroyed"]:
             return
+        runtime["destroyed"] = True
+        runtime["operation_generation"] = int(runtime.get("operation_generation") or 0) + 1
 
-        row_font = app._font(10)
-        row_bold_font = app._font(10, "bold")
-
-        for row_slot in range(sync_detail_rows_per_page):
-            item = page_items[row_slot] if row_slot < len(page_items) else None
-            row_bg = colors.SURFACE_ALT
-
-            row_frame = tk.Frame(
-                sync_detail_body_frame,
-                bg=row_bg,
-                highlightthickness=0,
-                bd=0,
-                height=row_height,
-            )
-            row_frame.pack(fill="x")
-            row_frame.pack_propagate(False)
-            row_frame.grid_propagate(False)
-            _configure_sync_detail_columns(row_frame, col_widths)
-
-            if item is None:
-                _draw_sync_detail_column_separators(
-                    row_frame,
-                    col_widths,
-                    row_height,
-                )
-                tk.Frame(
-                    row_frame,
-                    bg=colors.BORDER,
-                    height=1,
-                    bd=0,
-                    highlightthickness=0,
-                ).place(relx=0.0, rely=1.0, relwidth=1.0, anchor="sw")
-                continue
-
-            item_id = str(item.get("item_id") or "")
-            action_state = str(sync_detail_state["action_states"].get(item_id, "idle"))
-
-            status_key = str(item.get("status") or "error")
-            if status_key == "registration_required" and action_state == "done":
-                status_key = "normal"
-
-            status_meta = _get_sync_detail_status_meta(status_key)
-            status_icon = sync_detail_icons.get(str(status_meta.get("icon") or "error.svg"))
-
-            status_cell = tk.Frame(
-                row_frame,
-                bg=row_bg,
-                highlightthickness=0,
-                bd=0,
-            )
-            status_cell.grid(row=0, column=0, sticky="nsew")
-
-            status_group = tk.Frame(
-                status_cell,
-                bg=row_bg,
-                highlightthickness=0,
-                bd=0,
-            )
-            status_group.place(relx=0.5, rely=0.5, anchor="center")
-
-            if status_icon is not None:
-                status_icon_label = tk.Label(
-                    status_group,
-                    image=status_icon,
-                    bg=row_bg,
-                    anchor="center",
-                )
-                status_icon_label.image = status_icon
-                status_icon_label.pack(side="left")
-
-            status_label = tk.Label(
-                status_group,
-                text=str(status_meta.get("label") or "오류"),
-                font=row_bold_font,
-                fg=str(status_meta.get("text_color") or SYNC_TEXT_TITLE),
-                bg=row_bg,
-                anchor="w",
-                justify="left",
-            )
-            status_label.pack(side="left", padx=(6, 0))
-
-            filename_raw = str(item.get("filename") or "-")
-            path_raw = str(item.get("relative_path") or "-")
-            detail_raw = str(item.get("detail") or status_meta.get("detail_fallback") or "-")
-            if status_key == "normal":
-                detail_raw = "-"
-            size_text = _format_sync_detail_file_size(item.get("size_bytes"))
-
-            filename_text = _truncate_sync_detail_text(
-                filename_raw,
-                max(10, int(col_widths[1]) - 20),
-                row_bold_font,
-            )
-            path_text = _truncate_sync_detail_text(
-                path_raw,
-                max(10, int(col_widths[2]) - 20),
-                row_font,
-            )
-            detail_text = _truncate_sync_detail_text(
-                detail_raw,
-                max(10, int(col_widths[4]) - 10),
-                row_font,
-            )
-
-            filename_cell = tk.Frame(
-                row_frame,
-                bg=row_bg,
-                highlightthickness=0,
-                bd=0,
-            )
-            filename_cell.grid(row=0, column=1, sticky="nsew")
-
-            filename_label = tk.Label(
-                filename_cell,
-                text=filename_text,
-                font=row_bold_font,
-                fg=SYNC_TEXT_VALUE,
-                bg=row_bg,
-                anchor="w",
-                justify="left",
-            )
-            filename_label.pack(side="left", padx=(10, 6), pady=(0, 0))
-
-            path_cell = tk.Frame(
-                row_frame,
-                bg=row_bg,
-                highlightthickness=0,
-                bd=0,
-            )
-            path_cell.grid(row=0, column=2, sticky="nsew")
-
-            path_label = tk.Label(
-                path_cell,
-                text=path_text,
-                font=row_font,
-                fg=SYNC_TEXT_LABEL,
-                bg=row_bg,
-                anchor="w",
-                justify="left",
-            )
-            path_label.pack(side="left", padx=(10, 6), pady=(0, 0))
-
-            size_label = tk.Label(
-                row_frame,
-                text=size_text,
-                font=row_font,
-                fg=SYNC_TEXT_TITLE,
-                bg=row_bg,
-                anchor="center",
-                justify="center",
-            )
-            size_label.grid(row=0, column=3, sticky="nsew", padx=(4, 4))
-
-            detail_label = tk.Label(
-                row_frame,
-                text=detail_text,
-                font=row_font,
-                fg=str(status_meta.get("detail_color") or status_meta.get("text_color") or SYNC_TEXT_LABEL),
-                bg=row_bg,
-                anchor="center",
-                justify="center",
-            )
-            detail_label.grid(row=0, column=4, sticky="nsew", padx=(4, 4))
-
-            action_cell = tk.Frame(
-                row_frame,
-                bg=row_bg,
-                highlightthickness=0,
-                bd=0,
-            )
-            action_cell.grid(row=0, column=5, sticky="nsew")
-
-            if status_key == "registration_required":
-                action_button = _build_sync_detail_action_button(
-                    action_cell,
-                    item_id,
-                )
-                action_button.place(relx=0.5, rely=0.5, anchor="center")
-            else:
-                action_dash = tk.Label(
-                    action_cell,
-                    text="—",
-                    font=app._font(11, "bold"),
-                    fg=SYNC_TEXT_LABEL,
-                    bg=row_bg,
-                    anchor="center",
-                    justify="center",
-                )
-                action_dash.place(relx=0.5, rely=0.5, anchor="center")
-
-            _draw_sync_detail_column_separators(
-                row_frame,
-                col_widths,
-                row_height,
-            )
-
-            tk.Frame(
-                row_frame,
-                bg=colors.BORDER,
-                height=1,
-                bd=0,
-                highlightthickness=0,
-            ).place(relx=0.0, rely=1.0, relwidth=1.0, anchor="sw")
-
-    def _render_sync_detail_pagination(filtered_items):
-        for child in sync_detail_footer_frame.winfo_children():
-            child.destroy()
-
-        page_count = _get_sync_detail_page_count(filtered_items)
-        current_page = int(sync_detail_state["page_index"])
-
-        pager_shell = tk.Frame(
-            sync_detail_footer_frame,
-            bg=SYNC_CARD_BG,
-            highlightthickness=0,
-            bd=0,
-        )
-        pager_shell.place(relx=0.5, rely=0.5, anchor="center")
-
-        can_go_prev = current_page > 0
-        can_go_next = current_page < (page_count - 1)
-
-        first_btn = _build_sync_detail_pagination_icon_button(
-            pager_shell,
-            "far_before.svg",
-            enabled=can_go_prev,
-            command=lambda: _set_sync_detail_page(0),
-        )
-        first_btn.pack(side="left", padx=(0, 6))
-
-        prev_btn = _build_sync_detail_pagination_icon_button(
-            pager_shell,
-            "before.svg",
-            enabled=can_go_prev,
-            command=lambda: _set_sync_detail_page(current_page - 1),
-        )
-        prev_btn.pack(side="left", padx=(0, 8))
-
-        tk.Label(
-            pager_shell,
-            text=f"{current_page + 1} / {page_count}",
-            font=app._font(12),
-            fg=SYNC_TEXT_TITLE,
-            bg=SYNC_CARD_BG,
-            anchor="center",
-            justify="center",
-        ).pack(side="left", padx=(0, 8))
-
-        next_btn = _build_sync_detail_pagination_icon_button(
-            pager_shell,
-            "after.svg",
-            enabled=can_go_next,
-            command=lambda: _set_sync_detail_page(current_page + 1),
-        )
-        next_btn.pack(side="left", padx=(0, 6))
-
-        last_btn = _build_sync_detail_pagination_icon_button(
-            pager_shell,
-            "far_after.svg",
-            enabled=can_go_next,
-            command=lambda: _set_sync_detail_page(page_count - 1),
-        )
-        last_btn.pack(side="left")
-
-    def _refresh_sync_detail_view():
-        if not _is_sync_detail_widget_alive(sync_detail_table_shell):
-            return
-
-        filtered_items = _apply_sync_detail_filter(sync_detail_state["items"])
-        _clamp_sync_detail_page(filtered_items)
-
-        table_metrics = _get_sync_detail_table_metrics()
-        header_height = int(table_metrics["header_height"])
-        row_height = int(table_metrics["row_height"])
-        body_height = int(table_metrics["body_height"])
-        footer_height = int(table_metrics["footer_height"])
-
-        sync_detail_header_frame.configure(height=header_height)
-        sync_detail_body_frame.configure(height=body_height)
-        sync_detail_footer_frame.configure(height=footer_height)
-
-        available_width = max(780, int(sync_detail_table_shell.winfo_width()) - 4)
-        col_widths = _get_sync_detail_column_widths(available_width)
-
-        _draw_sync_detail_filter_button()
-        _render_sync_detail_header(col_widths, header_height)
-        _render_sync_detail_rows(col_widths, row_height)
-        _render_sync_detail_pagination(filtered_items)
-
-    def _schedule_sync_detail_refresh(_event=None):
-        refresh_job = sync_detail_state.get("refresh_job")
-        if refresh_job is not None:
-            return
-
-        def _run_refresh():
-            sync_detail_state["refresh_job"] = None
-            _refresh_sync_detail_view()
-
-        try:
-            sync_detail_state["refresh_job"] = app.root.after(16, _run_refresh)
-        except Exception:
-            sync_detail_state["refresh_job"] = None
-
-    def _on_filter_button_enter(_event=None):
-        sync_detail_state["filter_hovered"] = True
-        _draw_sync_detail_filter_button()
-
-    def _on_filter_button_leave(_event=None):
-        sync_detail_state["filter_hovered"] = False
-        _draw_sync_detail_filter_button()
-
-    def _on_detail_destroy(_event=None):
         _close_sync_detail_filter_popup(redraw=False)
-
-        for job_id in list(sync_detail_state["action_jobs"].values()):
-            try:
-                app.root.after_cancel(job_id)
-            except Exception:
-                pass
-        sync_detail_state["action_jobs"].clear()
 
         refresh_job = sync_detail_state.get("refresh_job")
         if refresh_job is not None:
@@ -2882,25 +3822,44 @@ def show_sync_workspace_screen(app):
                 pass
             sync_detail_state["refresh_job"] = None
 
+        anim_job = sync_card_animation.get("anim_job")
+        if anim_job is not None:
+            try:
+                app.root.after_cancel(anim_job)
+            except Exception:
+                pass
+            sync_card_animation["anim_job"] = None
+
+        worker_poll_job = runtime.get("worker_poll_job")
+        runtime["worker_poll_job"] = None
+
+        if worker_poll_job is not None:
+            try:
+                app.root.after_cancel(worker_poll_job)
+            except Exception:
+                pass
+
     sync_detail_filter_button.bind("<Configure>", lambda _event: _draw_sync_detail_filter_button(), add="+")
     sync_detail_filter_button.bind("<Button-1>", _toggle_sync_detail_filter_popup, add="+")
     sync_detail_filter_button.bind("<Enter>", _on_filter_button_enter, add="+")
     sync_detail_filter_button.bind("<Leave>", _on_filter_button_leave, add="+")
 
     sync_detail_table_shell.bind("<Configure>", _schedule_sync_detail_refresh, add="+")
-    detail_card_content.bind("<Destroy>", _on_detail_destroy, add="+")
+    detail_card_content.bind("<Destroy>", _on_screen_destroy, add="+")
 
-    _refresh_sync_detail_view()
+    _derive_workspace_identity()
 
-    app.last_scan_value = None
-    app.last_sync_value = None
-    app.indexed_count_value = None
-    app.pending_count_value = None
-    app.missing_count_value = None
-    app.error_count_value = None
-    app.state_value = None
-    app.results_container = None
-    app.summary_indexed = None
-    app.summary_new = None
-    app.summary_missing = None
-    app.summary_errors = None
+    if runtime.get("service") is None:
+        _set_sync_card_state(
+            SYNC_CARD_STATE_FAILED,
+            failure_message=runtime.get("service_init_error") or "재조정 서비스를 초기화할 수 없습니다.",
+        )
+    else:
+        _set_sync_card_state(
+            SYNC_CARD_STATE_INITIAL,
+            summary=dict((runtime.get("latest_snapshot") or {}).get("summary") or {}),
+        )
+
+    _start_worker_event_poller()
+
+    _refresh_workspace_sync_views()

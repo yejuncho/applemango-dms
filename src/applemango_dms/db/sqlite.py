@@ -1,4 +1,6 @@
 import sqlite3
+import re
+import stat
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -118,11 +120,18 @@ class ArchiveDatabase:
                     is_active INTEGER NOT NULL DEFAULT 1
                         CHECK (is_active IN (0, 1)),
 
+                    last_reconciliation_check_at TEXT,
+                    last_reconciliation_sync_at TEXT,
+
                     created_at TEXT NOT NULL
                         DEFAULT CURRENT_TIMESTAMP,
                     deleted_at TEXT
                 );
                 """
+            )
+
+            self._migrate_workspaces_reconciliation_columns(
+                conn
             )
 
             conn.execute(
@@ -152,94 +161,11 @@ class ArchiveDatabase:
                 """
             )
 
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                    -- relationships
-                    workspace_id INTEGER NOT NULL,
-                    document_type_id INTEGER NOT NULL,
-
-                    -- ownership
-                    uploaded_by TEXT NOT NULL,
-
-                    -- file names
-                    original_filename TEXT NOT NULL,
-                    archived_filename TEXT NOT NULL,
-
-                    -- paths
-                    relative_path TEXT NOT NULL,
-
-                    -- dates
-                    document_date TEXT NOT NULL,
-                    source_created_at TEXT,
-                    source_modified_at TEXT,
-
-                    -- technical metadata
-                    file_ext TEXT NOT NULL,
-                    mime_type TEXT,
-
-                    file_size INTEGER
-                        CHECK (file_size IS NULL
-                        OR file_size >= 0),
-
-                    checksum TEXT,
-
-                    -- record provenance
-                    record_origin TEXT NOT NULL DEFAULT 'dms_upload'
-                        CHECK (
-                            record_origin IN (
-                                'dms_upload',
-                                'nas_scan'
-                            )
-                        ),
-
-                    metadata_status TEXT NOT NULL DEFAULT 'complete'
-                        CHECK (
-                            metadata_status IN (
-                                'complete',
-                                'incomplete'
-                            )
-                        ),
-
-                    discovered_at TEXT,
-
-                    -- lifecycle
-                    archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-                    -- status
-                    status TEXT NOT NULL DEFAULT 'active'
-                        CHECK (
-                            status IN (
-                                'active',
-                                'deleted',
-                                'missing'
-                            )
-                        ),
-
-                    deleted_at TEXT,
-
-                    UNIQUE (workspace_id, archived_filename),
-                    UNIQUE (workspace_id, relative_path),
-
-                    FOREIGN KEY (workspace_id)
-                        REFERENCES workspaces(id)
-                        ON UPDATE CASCADE
-                        ON DELETE RESTRICT,
-
-                    FOREIGN KEY (
-                    workspace_id,
-                    document_type_id
-                    )
-                        REFERENCES document_types(
-                        workspace_id,
-                        id
-                        )
-                        ON UPDATE CASCADE
-                        ON DELETE RESTRICT
-                );
-                """
+            self._create_files_table(
+                conn,
+                table_name="files",
+                if_not_exists=True,
+                include_archived_filename_unique=False,
             )
 
             conn.execute(
@@ -287,8 +213,384 @@ class ArchiveDatabase:
                 conn
             )
 
+            self._migrate_files_remove_archived_filename_uniqueness(
+                conn
+            )
+
             self._create_indexes(conn)
             conn.commit()
+
+    def _create_files_table(
+        self,
+        conn,
+        *,
+        table_name,
+        if_not_exists,
+        include_archived_filename_unique,
+    ):
+        if not re.match(
+            r"^[A-Za-z_][A-Za-z0-9_]*$",
+            str(table_name or ""),
+        ):
+            raise ValueError(
+                "table_name must be a valid "
+                "SQLite identifier."
+            )
+
+        create_guard = (
+            "IF NOT EXISTS "
+            if bool(if_not_exists)
+            else ""
+        )
+
+        archived_filename_unique_sql = (
+            "UNIQUE (workspace_id, archived_filename),"
+            if bool(include_archived_filename_unique)
+            else ""
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE {create_guard}{table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                -- relationships
+                workspace_id INTEGER NOT NULL,
+                document_type_id INTEGER NOT NULL,
+
+                -- ownership
+                uploaded_by TEXT NOT NULL,
+
+                -- file names
+                original_filename TEXT NOT NULL,
+                archived_filename TEXT NOT NULL,
+
+                -- paths
+                relative_path TEXT NOT NULL,
+
+                -- dates
+                document_date TEXT NOT NULL,
+                source_created_at TEXT,
+                source_modified_at TEXT,
+
+                -- technical metadata
+                file_ext TEXT NOT NULL,
+                mime_type TEXT,
+
+                file_size INTEGER
+                    CHECK (file_size IS NULL
+                    OR file_size >= 0),
+
+                checksum TEXT,
+
+                -- record provenance
+                record_origin TEXT NOT NULL DEFAULT 'dms_upload'
+                    CHECK (
+                        record_origin IN (
+                            'dms_upload',
+                            'nas_scan'
+                        )
+                    ),
+
+                metadata_status TEXT NOT NULL DEFAULT 'complete'
+                    CHECK (
+                        metadata_status IN (
+                            'complete',
+                            'incomplete'
+                        )
+                    ),
+
+                discovered_at TEXT,
+
+                -- lifecycle
+                archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+                -- status
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK (
+                        status IN (
+                            'active',
+                            'deleted',
+                            'missing'
+                        )
+                    ),
+
+                deleted_at TEXT,
+
+                {archived_filename_unique_sql}
+                UNIQUE (workspace_id, relative_path),
+
+                FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id)
+                    ON UPDATE CASCADE
+                    ON DELETE RESTRICT,
+
+                FOREIGN KEY (
+                workspace_id,
+                document_type_id
+                )
+                    REFERENCES document_types(
+                    workspace_id,
+                    id
+                    )
+                    ON UPDATE CASCADE
+                    ON DELETE RESTRICT
+            );
+            """
+        )
+
+    def _has_unique_index_on_columns(
+        self,
+        conn,
+        *,
+        table_name,
+        expected_columns,
+    ):
+        if not re.match(
+            r"^[A-Za-z_][A-Za-z0-9_]*$",
+            str(table_name or ""),
+        ):
+            raise ValueError(
+                "table_name must be a valid "
+                "SQLite identifier."
+            )
+
+        target = [
+            str(column)
+            for column in expected_columns
+        ]
+
+        index_rows = conn.execute(
+            f"""
+            PRAGMA index_list({table_name});
+            """
+        ).fetchall()
+
+        for index_row in index_rows:
+            is_unique = int(index_row["unique"]) == 1
+            if not is_unique:
+                continue
+
+            index_name = str(index_row["name"] or "")
+            if not index_name:
+                continue
+
+            index_info = conn.execute(
+                f"""
+                PRAGMA index_info({index_name});
+                """
+            ).fetchall()
+
+            ordered_columns = [
+                str(info_row["name"] or "")
+                for info_row in sorted(
+                    index_info,
+                    key=lambda row: int(row["seqno"]),
+                )
+            ]
+
+            if ordered_columns == target:
+                return True
+
+        return False
+
+    def _files_has_archived_filename_uniqueness(
+        self,
+        conn,
+    ):
+        return self._has_unique_index_on_columns(
+            conn,
+            table_name="files",
+            expected_columns=[
+                "workspace_id",
+                "archived_filename",
+            ],
+        )
+
+    def _migrate_files_remove_archived_filename_uniqueness(
+        self,
+        conn,
+    ):
+        """
+        Rebuild files table only when legacy workspace-wide filename
+        uniqueness still exists.
+
+        This migration preserves file IDs and validates foreign-key
+        integrity before completion.
+        """
+        if not self._files_has_archived_filename_uniqueness(conn):
+            return False
+
+        files_row_count_before = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM files
+                """
+            ).fetchone()[0]
+        )
+
+        foreign_keys_enabled = int(
+            conn.execute(
+                """
+                PRAGMA foreign_keys;
+                """
+            ).fetchone()[0]
+        )
+
+        # PRAGMA foreign_keys can only be changed outside a transaction.
+        conn.commit()
+
+        if foreign_keys_enabled:
+            conn.execute(
+                """
+                PRAGMA foreign_keys = OFF;
+                """
+            )
+
+        try:
+            conn.execute(
+                """
+                BEGIN IMMEDIATE;
+                """
+            )
+
+            conn.execute(
+                """
+                DROP TABLE IF EXISTS files__rebuilt;
+                """
+            )
+
+            self._create_files_table(
+                conn,
+                table_name="files__rebuilt",
+                if_not_exists=False,
+                include_archived_filename_unique=False,
+            )
+
+            conn.execute(
+                """
+                INSERT INTO files__rebuilt (
+                    id,
+                    workspace_id,
+                    document_type_id,
+                    uploaded_by,
+                    original_filename,
+                    archived_filename,
+                    relative_path,
+                    document_date,
+                    source_created_at,
+                    source_modified_at,
+                    file_ext,
+                    mime_type,
+                    file_size,
+                    checksum,
+                    record_origin,
+                    metadata_status,
+                    discovered_at,
+                    archived_at,
+                    status,
+                    deleted_at
+                )
+                SELECT
+                    id,
+                    workspace_id,
+                    document_type_id,
+                    uploaded_by,
+                    original_filename,
+                    archived_filename,
+                    relative_path,
+                    document_date,
+                    source_created_at,
+                    source_modified_at,
+                    file_ext,
+                    mime_type,
+                    file_size,
+                    checksum,
+                    record_origin,
+                    metadata_status,
+                    discovered_at,
+                    archived_at,
+                    status,
+                    deleted_at
+                FROM files
+                """
+            )
+
+            files_row_count_after_copy = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM files__rebuilt
+                    """
+                ).fetchone()[0]
+            )
+
+            if files_row_count_after_copy != files_row_count_before:
+                raise RuntimeError(
+                    "files table migration copied an "
+                    "unexpected row count."
+                )
+
+            conn.execute(
+                """
+                DROP TABLE files;
+                """
+            )
+
+            conn.execute(
+                """
+                ALTER TABLE files__rebuilt RENAME TO files;
+                """
+            )
+
+            fk_violations = conn.execute(
+                """
+                PRAGMA foreign_key_check;
+                """
+            ).fetchall()
+
+            if fk_violations:
+                first = fk_violations[0]
+                raise RuntimeError(
+                    "foreign_key_check failed after files "
+                    "table migration: "
+                    f"table={first['table']}, "
+                    f"rowid={first['rowid']}, "
+                    f"parent={first['parent']}, "
+                    f"fkid={first['fkid']}"
+                )
+
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            raise
+
+        finally:
+            if foreign_keys_enabled:
+                conn.execute(
+                    """
+                    PRAGMA foreign_keys = ON;
+                    """
+                )
+
+        if foreign_keys_enabled:
+            reenabled = int(
+                conn.execute(
+                    """
+                    PRAGMA foreign_keys;
+                    """
+                ).fetchone()[0]
+            )
+
+            if reenabled != 1:
+                raise RuntimeError(
+                    "Failed to re-enable foreign key "
+                    "enforcement after migration."
+                )
+
+        return True
 
     def _migrate_files_reconciliation_columns(
         self,
@@ -344,6 +646,37 @@ class ArchiveDatabase:
                 """
                 ALTER TABLE files
                 ADD COLUMN discovered_at TEXT;
+                """
+            )
+
+    def _migrate_workspaces_reconciliation_columns(
+        self,
+        conn,
+    ):
+        rows = conn.execute(
+            """
+            PRAGMA table_info(workspaces);
+            """
+        ).fetchall()
+
+        existing_columns = {
+            str(row["name"])
+            for row in rows
+        }
+
+        if "last_reconciliation_check_at" not in existing_columns:
+            conn.execute(
+                """
+                ALTER TABLE workspaces
+                ADD COLUMN last_reconciliation_check_at TEXT;
+                """
+            )
+
+        if "last_reconciliation_sync_at" not in existing_columns:
+            conn.execute(
+                """
+                ALTER TABLE workspaces
+                ADD COLUMN last_reconciliation_sync_at TEXT;
                 """
             )
 
@@ -428,13 +761,17 @@ class ArchiveDatabase:
         if row is None:
             return None
 
+        row_data = dict(row)
+
         return {
-            "id": int(row["id"]),
-            "name": str(row["name"]),
-            "share_path": str(row["share_path"]),
-            "is_active": bool(row["is_active"]),
-            "created_at": row["created_at"],
-            "deleted_at": row["deleted_at"],
+            "id": int(row_data["id"]),
+            "name": str(row_data["name"]),
+            "share_path": str(row_data["share_path"]),
+            "is_active": bool(row_data["is_active"]),
+            "last_reconciliation_check_at": row_data.get("last_reconciliation_check_at"),
+            "last_reconciliation_sync_at": row_data.get("last_reconciliation_sync_at"),
+            "created_at": row_data.get("created_at"),
+            "deleted_at": row_data.get("deleted_at"),
         }
 
     @staticmethod
@@ -541,6 +878,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -590,6 +929,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -634,6 +975,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -1576,6 +1919,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -1592,6 +1937,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -1673,6 +2020,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -1714,6 +2063,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -1747,6 +2098,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -1864,6 +2217,8 @@ class ArchiveDatabase:
                     name,
                     share_path,
                     is_active,
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at,
                     created_at,
                     deleted_at
                 FROM workspaces
@@ -3182,16 +3537,12 @@ class ArchiveDatabase:
                 FROM files
                 WHERE workspace_id = ?
                   AND id != ?
-                  AND (
-                      archived_filename = ?
-                      OR relative_path = ?
-                  )
+                  AND relative_path = ?
                 LIMIT 1
                 """,
                 (
                     normalized_workspace_id,
                     normalized_file_id,
-                    normalized_archived_filename,
                     normalized_relative_path,
                 ),
             ).fetchone()
@@ -3199,7 +3550,7 @@ class ArchiveDatabase:
             if collision is not None:
                 raise FileExistsError(
                     "Another database record already uses "
-                    "the requested filename or path."
+                    "the requested path."
                 )
 
             cursor = conn.execute(
@@ -3542,6 +3893,25 @@ class ArchiveDatabase:
     def _normalize_optional_text(value):
         normalized = str(value or "").strip()
         return normalized or None
+
+    @staticmethod
+    def _normalize_optional_iso_timestamp(
+        value,
+        field_name,
+    ):
+        normalized = str(value or "").strip()
+
+        if not normalized:
+            return None
+
+        try:
+            datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            raise ValueError(
+                f"{field_name} must be a valid ISO-8601 timestamp."
+            ) from exc
+
+        return normalized
 
     @staticmethod
     def _infer_discovered_document_date(
@@ -4534,10 +4904,16 @@ class ArchiveDatabase:
         self,
         workspace_id,
         file_record,
+        *,
+        acting_user,
     ):
         """
         Insert one filesystem-discovered file as an incomplete NAS
         reconciliation record.
+
+        The acting_user becomes uploaded_by ownership for newly
+        inserted records. Existing-path idempotent skips do not
+        rewrite ownership.
 
         Returns:
             A dictionary containing:
@@ -4552,6 +4928,10 @@ class ArchiveDatabase:
                 workspace_id,
                 "workspace_id",
             )
+        )
+        normalized_acting_user = self._require_text(
+            acting_user,
+            "acting_user",
         )
 
         if not isinstance(file_record, dict):
@@ -4662,7 +5042,7 @@ class ArchiveDatabase:
             record = {
                 "workspace_id": normalized_workspace_id,
                 "document_type_id": document_type_id,
-                "uploaded_by": self.RECONCILIATION_UPLOADER_NAME,
+                "uploaded_by": normalized_acting_user,
                 "original_filename": original_filename,
                 "archived_filename": archived_filename,
                 "relative_path": relative_path,
@@ -4735,10 +5115,23 @@ class ArchiveDatabase:
 
             share_path = Path(workspace["share_path"])
 
-            if not share_path.exists():
+            try:
+                share_path_stat = share_path.stat()
+            except (FileNotFoundError, NotADirectoryError) as exc:
                 raise ConnectionError(
                     f"The workspace shared folder at "
                     f"'{share_path}' is not currently accessible."
+                ) from exc
+            except OSError as exc:
+                raise ConnectionError(
+                    f"The workspace shared folder at "
+                    f"'{share_path}' could not be inspected: {exc}"
+                ) from exc
+
+            if not stat.S_ISDIR(share_path_stat.st_mode):
+                raise ConnectionError(
+                    f"The workspace shared folder at "
+                    f"'{share_path}' is not a directory."
                 )
 
             rows = conn.execute(
@@ -4760,27 +5153,47 @@ class ArchiveDatabase:
 
             missing_ids = []
             restored_ids = []
+            error_records = []
 
             for row in rows:
                 full_path = share_path / row["relative_path"]
+                relative_path = str(
+                    row["relative_path"] or ""
+                ).strip()
+                file_id = int(row["id"])
 
                 try:
-                    file_exists = full_path.is_file()
-                except OSError:
-                    file_exists = False
+                    file_stat = full_path.stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    file_state = "absent"
+                except OSError as exc:
+                    error_records.append(
+                        {
+                            "file_id": file_id,
+                            "relative_path": relative_path,
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    )
+                    continue
+                else:
+                    file_state = (
+                        "present"
+                        if stat.S_ISREG(file_stat.st_mode)
+                        else "absent"
+                    )
 
                 current_status = row["status"]
-                file_id = int(row["id"])
 
                 if (
                     current_status == self.STATUS_ACTIVE
-                    and not file_exists
+                    and file_state == "absent"
                 ):
                     missing_ids.append(file_id)
 
                 elif (
                     current_status == self.STATUS_MISSING
-                    and file_exists
+                    and file_state == "present"
                 ):
                     restored_ids.append(file_id)
 
@@ -4822,6 +5235,8 @@ class ArchiveDatabase:
                 "marked_missing": len(missing_ids),
                 "restored_active": len(restored_ids),
                 "checked": len(rows),
+                "error_count": len(error_records),
+                "errors": error_records,
             }
 
     def audit_missing_files(self, workspace_id):
@@ -4842,7 +5257,7 @@ class ArchiveDatabase:
 
         return int(row[0])
 
-    def get_workspace_last_check_timestamp(self, workspace_id):
+    def get_workspace_reconciliation_state(self, workspace_id):
         normalized_workspace_id = self._normalize_positive_int(
             workspace_id,
             "workspace_id",
@@ -4852,28 +5267,129 @@ class ArchiveDatabase:
             row = conn.execute(
                 """
                 SELECT
-                    MAX(discovered_at) AS last_check_at
-                FROM files
-                WHERE workspace_id = ?
-                  AND record_origin = ?
-                  AND discovered_at IS NOT NULL
+                    last_reconciliation_check_at,
+                    last_reconciliation_sync_at
+                FROM workspaces
+                WHERE id = ?
+                LIMIT 1;
                 """,
-                (
-                    normalized_workspace_id,
-                    self.RECORD_ORIGIN_NAS_SCAN,
-                ),
+                (normalized_workspace_id,),
             ).fetchone()
 
         if row is None:
-            return None
+            raise LookupError("Workspace not found.")
 
-        value = row["last_check_at"]
+        last_check_at = self._normalize_optional_text(
+            row["last_reconciliation_check_at"]
+        )
+        last_sync_at = self._normalize_optional_text(
+            row["last_reconciliation_sync_at"]
+        )
 
-        if value is None:
-            return None
+        return {
+            "workspace_id": normalized_workspace_id,
+            "last_check_at": last_check_at,
+            "last_sync_at": last_sync_at,
+        }
 
-        text = str(value).strip()
-        return text or None
+    def record_workspace_reconciliation_check(
+        self,
+        workspace_id,
+        timestamp=None,
+    ):
+        normalized_workspace_id = self._normalize_positive_int(
+            workspace_id,
+            "workspace_id",
+        )
+
+        normalized_timestamp = self._normalize_optional_iso_timestamp(
+            timestamp,
+            "timestamp",
+        )
+
+        if normalized_timestamp is None:
+            normalized_timestamp = datetime.now().isoformat(
+                timespec="seconds",
+            )
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE workspaces
+                SET last_reconciliation_check_at = ?
+                WHERE id = ?;
+                """,
+                (
+                    normalized_timestamp,
+                    normalized_workspace_id,
+                ),
+            )
+
+            if int(cursor.rowcount or 0) == 0:
+                raise LookupError("Workspace not found.")
+
+        return normalized_timestamp
+
+    def record_workspace_reconciliation_sync(
+        self,
+        workspace_id,
+        *,
+        sync_timestamp=None,
+        check_timestamp=None,
+    ):
+        normalized_workspace_id = self._normalize_positive_int(
+            workspace_id,
+            "workspace_id",
+        )
+
+        normalized_sync_timestamp = self._normalize_optional_iso_timestamp(
+            sync_timestamp,
+            "sync_timestamp",
+        )
+
+        if normalized_sync_timestamp is None:
+            normalized_sync_timestamp = datetime.now().isoformat(
+                timespec="seconds",
+            )
+
+        normalized_check_timestamp = self._normalize_optional_iso_timestamp(
+            check_timestamp,
+            "check_timestamp",
+        )
+
+        if normalized_check_timestamp is None:
+            normalized_check_timestamp = normalized_sync_timestamp
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE workspaces
+                SET
+                    last_reconciliation_check_at = ?,
+                    last_reconciliation_sync_at = ?
+                WHERE id = ?;
+                """,
+                (
+                    normalized_check_timestamp,
+                    normalized_sync_timestamp,
+                    normalized_workspace_id,
+                ),
+            )
+
+            if int(cursor.rowcount or 0) == 0:
+                raise LookupError("Workspace not found.")
+
+        return {
+            "workspace_id": normalized_workspace_id,
+            "last_check_at": normalized_check_timestamp,
+            "last_sync_at": normalized_sync_timestamp,
+        }
+
+    def get_workspace_last_check_timestamp(self, workspace_id):
+        state = self.get_workspace_reconciliation_state(
+            workspace_id
+        )
+        return state.get("last_check_at")
 
     def get_archived_filenames(self, workspace_id):
         with self._connect() as conn:
