@@ -4842,6 +4842,39 @@ class ArchiveDatabase:
 
         return int(row[0])
 
+    def get_workspace_last_check_timestamp(self, workspace_id):
+        normalized_workspace_id = self._normalize_positive_int(
+            workspace_id,
+            "workspace_id",
+        )
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    MAX(discovered_at) AS last_check_at
+                FROM files
+                WHERE workspace_id = ?
+                  AND record_origin = ?
+                  AND discovered_at IS NOT NULL
+                """,
+                (
+                    normalized_workspace_id,
+                    self.RECORD_ORIGIN_NAS_SCAN,
+                ),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        value = row["last_check_at"]
+
+        if value is None:
+            return None
+
+        text = str(value).strip()
+        return text or None
+
     def get_archived_filenames(self, workspace_id):
         with self._connect() as conn:
             rows = conn.execute(
