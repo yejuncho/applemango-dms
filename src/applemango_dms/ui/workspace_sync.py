@@ -1568,26 +1568,45 @@ def show_sync_workspace_screen(app):
             )
             return None
 
-        runtime["busy"] = True
-        runtime["operation"] = str(operation_name)
-        runtime["operation_generation"] = int(runtime.get("operation_generation") or 0) + 1
-        runtime["failure_message"] = ""
-        runtime["message"] = ""
-        runtime["processed"] = 0
-        runtime["total"] = 0
+        app_guard_acquired = False
 
-        return {
-            "generation": int(runtime["operation_generation"]),
-            "workspace_id": int(workspace_id),
-            "workspace_name": workspace_name,
-            "workspace_root": str(workspace_root),
-        }
+        try:
+            if not app.begin_file_operation():
+                app._show_file_operation_blocked_message()
+                return None
+
+            app_guard_acquired = True
+
+            runtime["busy"] = True
+            runtime["operation"] = str(operation_name)
+            runtime["operation_generation"] = int(runtime.get("operation_generation") or 0) + 1
+            runtime["failure_message"] = ""
+            runtime["message"] = ""
+            runtime["processed"] = 0
+            runtime["total"] = 0
+
+            return {
+                "generation": int(runtime["operation_generation"]),
+                "workspace_id": int(workspace_id),
+                "workspace_name": workspace_name,
+                "workspace_root": str(workspace_root),
+            }
+
+        except Exception:
+            if app_guard_acquired:
+                app.end_file_operation()
+            raise
 
     def _finish_operation(generation):
         if int(generation) != int(runtime.get("operation_generation") or 0):
             return
+
+        if not runtime.get("busy"):
+            return
+
         runtime["busy"] = False
         runtime["operation"] = None
+        app.end_file_operation()
 
     def _record_workspace_check_timestamp(
         workspace_id,

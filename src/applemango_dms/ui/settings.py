@@ -92,6 +92,20 @@ def _workspace_action_from_row(row):
         }
 
     if status == WORKSPACE_STATUS_ACTIVE:
+        workspace_id = row.get("workspace_id")
+        active_workspace_id = getattr(
+            state,
+            "active_workspace_id",
+            None,
+        )
+
+        if active_workspace_id is not None:
+            try:
+                if int(workspace_id) == int(active_workspace_id):
+                    return None
+            except (TypeError, ValueError):
+                pass
+
         return {
             "label": "사용 해제",
             "action": "deactivate",
@@ -670,7 +684,11 @@ def show_workspace_designation_window(app, parent_win=None):
     win.update_idletasks()
     _center_toplevel_to_parent(parent, win)
 
-def show_mapped_drives_window(root):
+def show_mapped_drives_window(app, root):
+    if app._is_file_operation_active():
+        app._show_file_operation_blocked_message()
+        return
+
     mapped_entries = get_mapped_network_drives()
     if mapped_entries is None:
         messagebox.showerror("매핑 드라이브", "매핑된 드라이브 목록을 읽을 수 없습니다.", parent=root)
@@ -741,6 +759,10 @@ def show_mapped_drives_window(root):
             unmap_btn.config(state="disabled", bg="#d9d9d9", fg="black", activebackground="#c0c0c0")
 
     def unmap_selected_drives():
+        if app._is_file_operation_active():
+            app._show_file_operation_blocked_message()
+            return
+
         selected_indices = list(listbox.curselection())
         if not selected_indices:
             return
@@ -781,6 +803,10 @@ def show_mapped_drives_window(root):
     unmap_btn.config(command=unmap_selected_drives)
 
 def show_change_server_name_dialog(app, parent_win):
+    if app._is_file_operation_active():
+        app._show_file_operation_blocked_message()
+        return
+
     dialog = tk.Toplevel(parent_win)
     dialog.title("서버 이름 변경")
     dialog.geometry("380x190")
@@ -835,6 +861,10 @@ def show_change_server_name_dialog(app, parent_win):
             apply_btn.config(state="disabled", bg="#d9d9d9", fg="black", activebackground="#c0c0c0")
 
     def apply_server_name():
+        if app._is_file_operation_active():
+            app._show_file_operation_blocked_message()
+            return
+
         cleaned = new_server_var.get().strip().lstrip("\\")
         if not cleaned:
             return
@@ -1118,7 +1148,7 @@ def show_settings_screen(app):
         system_rows,
         title="네트워크 드라이브 관리",
         icon_photo=icon_map["network"],
-        command=lambda: show_mapped_drives_window(settings_win),
+        command=lambda: show_mapped_drives_window(app, settings_win),
     ).pack(fill="x", pady=4)
 
     _create_section_heading(

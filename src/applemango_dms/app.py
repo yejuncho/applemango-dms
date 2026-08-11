@@ -307,8 +307,8 @@ class SequenceArchiverApp:
 
     def _show_file_operation_blocked_message(self):
         messagebox.showwarning(
-            "파일 작업 진행 중",
-            "파일 업로드가 진행 중입니다. 작업이 완료된 후 다시 시도해 주세요.",
+            "작업 진행 중",
+            "파일 또는 워크스페이스 작업이 진행 중입니다. 작업이 완료된 후 다시 시도해 주세요.",
             parent=self.root,
         )
 
@@ -798,6 +798,11 @@ class SequenceArchiverApp:
                 "Database is not initialized."
             )
 
+        if self._is_file_operation_active():
+            raise RuntimeError(
+                "A critical operation is active. Cannot designate workspace right now."
+            )
+
         workspace = self.db.designate_workspace(
             workspace_name,
             share_path,
@@ -819,8 +824,42 @@ class SequenceArchiverApp:
                 "Database is not initialized."
             )
 
+        if self._is_file_operation_active():
+            raise RuntimeError(
+                "A critical operation is active. Cannot deactivate workspace right now."
+            )
+
+        try:
+            normalized_workspace_id = int(workspace_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "workspace_id must be an integer."
+            ) from exc
+
+        if normalized_workspace_id <= 0:
+            raise ValueError(
+                "workspace_id must be greater than zero."
+            )
+
+        active_workspace_id = getattr(
+            state,
+            "active_workspace_id",
+            None,
+        )
+
+        if active_workspace_id is not None:
+            try:
+                current_active_workspace_id = int(active_workspace_id)
+            except (TypeError, ValueError):
+                current_active_workspace_id = None
+
+            if current_active_workspace_id == normalized_workspace_id:
+                raise RuntimeError(
+                    "The currently active workspace cannot be deactivated. Leave the workspace first."
+                )
+
         workspace = self.db.deactivate_workspace(
-            workspace_id
+            normalized_workspace_id
         )
 
         self.workspace_metadata_cache.pop(
@@ -839,6 +878,11 @@ class SequenceArchiverApp:
         if self.db is None:
             raise RuntimeError(
                 "Database is not initialized."
+            )
+
+        if self._is_file_operation_active():
+            raise RuntimeError(
+                "A critical operation is active. Cannot reactivate workspace right now."
             )
 
         workspace = self.db.reactivate_workspace(
