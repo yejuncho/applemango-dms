@@ -169,7 +169,7 @@ def _format_sync_timestamp(value):
     except ValueError:
         return text
 
-    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    return parsed.strftime("%Y-%m-%d %H:%M")
 
 
 def _format_sync_count(value, fallback="-"):

@@ -356,7 +356,7 @@ def show_login_screen(app, prefill_username=None):
         sync_icon()
     remember_row = tk.Frame(frame, bg=LOGIN_PANEL_BG)
     remember_row.pack(fill="x", pady=(12, 2))
-    create_login_checkbox(remember_row, "로그인 정보 저장", remember_var, font_size=10)
+    create_login_checkbox(remember_row, "사용자명 기억", remember_var, font_size=10)
 
     demo_mode_row = tk.Frame(frame, bg=LOGIN_PANEL_BG)
     demo_mode_row.pack(fill="x", pady=(0, 16))
@@ -380,8 +380,8 @@ def show_login_screen(app, prefill_username=None):
             state.session_password = ""
             state.session_account_name = account_name
 
-            if remember_var.get() and username.strip() and password:
-                save_credentials(username, password)
+            if remember_var.get() and username.strip():
+                save_credentials(username)
             else:
                 clear_saved_credentials()
 
@@ -439,7 +439,7 @@ def show_login_screen(app, prefill_username=None):
 
         update_session_login(username, password)
         if remember_var.get():
-            save_credentials(username, password)
+            save_credentials(username)
         else:
             clear_saved_credentials()
 

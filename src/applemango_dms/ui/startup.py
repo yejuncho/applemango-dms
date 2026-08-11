@@ -1,14 +1,9 @@
 import tkinter as tk
-from tkinter import messagebox
 
 import applemango_dms.state as state
 
 from applemango_dms.services.auth import (
     load_saved_credentials,
-    authenticate_to_server,
-    update_session_login,
-    clear_saved_credentials,
-    clear_session_login,
 )
 
 from applemango_dms.ui import colors
@@ -41,25 +36,7 @@ def show_startup_screen(app):
 def route_from_startup(app):
     state.is_demo_mode = False
     saved = load_saved_credentials()
-    if not saved:
+    if not saved or not saved.get("username"):
         app.show_login_screen()
         return
-
-    ok, err = authenticate_to_server(saved["username"], saved["password"])
-    if ok:
-        update_session_login(saved["username"], saved["password"])
-        app.show_workspace_selection_screen()
-        return
-
-    clear_saved_credentials()
-    clear_session_login()
     app.show_login_screen(prefill_username=saved.get("username"))
-
-    startup_msg = "저장된 로그인으로 NAS 연결에 실패했습니다.\n아이디/패스워드를 다시 입력해 주세요."
-    if "1219" in str(err):
-        startup_msg = (
-            "이전 NAS 연결 정보와 충돌해 자동 로그인이 실패했습니다.\n"
-            "연결을 정리한 뒤 로그인 화면으로 이동했습니다.\n"
-            "아이디/패스워드를 다시 입력해 주세요."
-        )
-    messagebox.showinfo("자동 로그인 실패", startup_msg, parent=app.root)

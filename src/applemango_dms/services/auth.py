@@ -54,13 +54,12 @@ def load_saved_credentials():
         return None
 
     username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", ""))
-    if not username or not password:
+    if not username:
         return None
-    return {"username": username, "password": password}
+    return {"username": username}
 
-def save_credentials(username, password):
-    payload = {"username": username.strip(), "password": password}
+def save_credentials(username, _password=None):
+    payload = {"username": username.strip()}
     credential_store_path.write_text(json.dumps(payload), encoding="utf-8")
 
 def clear_saved_credentials():
@@ -78,13 +77,6 @@ def authenticate_to_server(username, password):
 
     first_err = login_result.stderr.strip() or login_result.stdout.strip() or "알 수 없는 오류"
     if "1219" in first_err:
-        subprocess.run(
-            ["net", "use", "*", "/delete", "/y"],
-            capture_output=True,
-            text=True,
-            encoding="cp949",
-            errors="replace",
-        )
         _wipe_server_connections(default_server_name)
         retry_result = _connect_ipc(username, password)
         if retry_result.returncode == 0:
