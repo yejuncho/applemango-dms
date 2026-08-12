@@ -1,11 +1,13 @@
 import sqlite3
+import subprocess
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import re
-from tkinter import TclError, messagebox
+from tkinter import TclError, filedialog, messagebox
 import applemango_dms.config as config
 import applemango_dms.state as state
 from applemango_dms.services.file_operations import FileOperationsService
@@ -22,7 +24,7 @@ except Exception:
     _PIL_AVAILABLE = False
 
 from applemango_dms.ui import colors
-from applemango_dms.utils.images import load_svg_photo
+from applemango_dms.utils.images import load_logo_photo, load_svg_photo
 
 SF_SURFACE = colors.SURFACE_ALT
 SF_BORDER = colors.BORDER_LIGHT
@@ -280,6 +282,64 @@ def show_search_files_screen(app):
         max_height=far_after_h,
     )
 
+    result_reset_icon_photo = load_svg_photo(
+        config.PROJECT_ROOT / "assets" / "icons" / "workspace" / "save_files" / "reset.svg",
+        max_width=18,
+        max_height=18,
+        tint=SF_TEXT_DARK,
+    )
+    toolbar_download_blue_icon_photo = load_svg_photo(
+        config.PROJECT_ROOT / "assets" / "icons" / "workspace" / "search_files" / "download_blue.svg",
+        max_width=14,
+        max_height=14,
+    )
+
+    detail_action_icon_size = 16
+    open_file_button_icon = load_svg_photo(
+        config.PROJECT_ROOT / "assets" / "icons" / "workspace" / "search_files" / "open_file.svg",
+        max_width=detail_action_icon_size,
+        max_height=detail_action_icon_size,
+        tint=colors.TEXT_INVERSE,
+    )
+    open_folder_button_icon = load_svg_photo(
+        config.PROJECT_ROOT / "assets" / "icons" / "workspace" / "search_files" / "open_folder.svg",
+        max_width=detail_action_icon_size,
+        max_height=detail_action_icon_size,
+        tint=SF_PRIMARY,
+    )
+    download_button_icon = load_svg_photo(
+        config.PROJECT_ROOT / "assets" / "icons" / "workspace" / "search_files" / "download.svg",
+        max_width=detail_action_icon_size,
+        max_height=detail_action_icon_size,
+        tint=colors.TEXT_INVERSE,
+    )
+    copy_path_button_icon = load_svg_photo(
+        config.PROJECT_ROOT / "assets" / "icons" / "workspace" / "search_files" / "copy_path.svg",
+        max_width=detail_action_icon_size,
+        max_height=detail_action_icon_size,
+        tint=SF_PRIMARY,
+    )
+
+    file_icon_dir = config.PROJECT_ROOT / "assets" / "icons" / "file_formats"
+    detail_file_format_icons = {
+        "word": load_logo_photo(file_icon_dir / "icons8-word-48.png", max_width=18, max_height=18),
+        "txt": load_logo_photo(file_icon_dir / "icons8-txt-48.png", max_width=18, max_height=18),
+        "pdf": load_logo_photo(file_icon_dir / "icons8-pdf-48.png", max_width=18, max_height=18),
+        "excel": load_logo_photo(file_icon_dir / "icons8-excel-48.png", max_width=18, max_height=18),
+        "csv": load_logo_photo(file_icon_dir / "icons8-csv-48.png", max_width=18, max_height=18),
+        "powerpoint": load_logo_photo(file_icon_dir / "icons8-powerpoint-48.png", max_width=18, max_height=18),
+        "image": load_logo_photo(file_icon_dir / "icons8-image-file-48.png", max_width=18, max_height=18),
+        "folder": load_logo_photo(file_icon_dir / "icons8-folder-48.png", max_width=18, max_height=18),
+        "archive_folder": load_logo_photo(file_icon_dir / "icons8-archive-folder-48.png", max_width=18, max_height=18),
+        "video": load_logo_photo(file_icon_dir / "icons8-video-48.png", max_width=18, max_height=18),
+        "audio": load_logo_photo(file_icon_dir / "icons8-audio-48.png", max_width=18, max_height=18),
+        "exe": load_logo_photo(file_icon_dir / "icons8-exe-48.png", max_width=18, max_height=18),
+        "design": load_logo_photo(file_icon_dir / "icons8-design-48.png", max_width=18, max_height=18),
+        "db": load_logo_photo(file_icon_dir / "icons8-db-48.png", max_width=18, max_height=18),
+        "html": load_logo_photo(file_icon_dir / "icons8-html-48.png", max_width=18, max_height=18),
+        "file": load_logo_photo(file_icon_dir / "icons8-file-48.png", max_width=18, max_height=18),
+    }
+
     filter_row = tk.Frame(left_top_card, bg=colors.SURFACE_ALT, highlightthickness=0, bd=0)
     filter_label = tk.Label(
         filter_row,
@@ -466,6 +526,7 @@ def show_search_files_screen(app):
         if (
             search_state["selected_file_id"] is not None
             and not _is_result_row_click_event(event)
+            and not _is_detail_card_click_event(event)
         ):
             _clear_detail_selection()
 
@@ -564,6 +625,10 @@ def show_search_files_screen(app):
                     return True
 
         return False
+
+    def _is_detail_card_click_event(event):
+        widget = getattr(event, "widget", None)
+        return widget is right_card
 
     def _start_search_placeholder():
         search_text_entry.focus_set()
@@ -2826,6 +2891,43 @@ def show_search_files_screen(app):
 
         return normalized.upper()
 
+    def _pick_file_format_icon_key(file_type_value):
+        normalized = _normalize_file_type(file_type_value)
+
+        if not normalized:
+            return "file"
+
+        if normalized in {"zip", "7z", "rar", "tar", "gz"}:
+            return "archive_folder"
+        if normalized in {"doc", "docx"}:
+            return "word"
+        if normalized in {"txt"}:
+            return "txt"
+        if normalized in {"pdf"}:
+            return "pdf"
+        if normalized in {"xls", "xlsx", "xlsm"}:
+            return "excel"
+        if normalized in {"csv"}:
+            return "csv"
+        if normalized in {"ppt", "pptx", "pptm"}:
+            return "powerpoint"
+        if normalized in {"jpg", "jpeg", "png", "gif", "tmp", "tif", "tiff", "webp", "svg"}:
+            return "image"
+        if normalized in {"mp4", "mov", "avi", "wmv", "mkv"}:
+            return "video"
+        if normalized in {"mp3", "wma", "m4a"}:
+            return "audio"
+        if normalized in {"exe", "msi", "bat", "cmd"}:
+            return "exe"
+        if normalized in {"psd", "ai", "indd", "xd"}:
+            return "design"
+        if normalized in {"db", "sqlite", "mdb", "accdb"}:
+            return "db"
+        if normalized in {"html", "htm"}:
+            return "html"
+
+        return "file"
+
     def _resolve_file_type_colors(value):
         normalized = _normalize_file_type(value)
         return colors.FILE_TYPE_COLORS.get(
@@ -3043,6 +3145,57 @@ def show_search_files_screen(app):
                 high = middle - 1
 
         return value[:low] + suffix
+
+    def _truncate_canvas_multiline_text(
+        canvas,
+        text,
+        max_width,
+        max_height,
+        font,
+        truncate_suffix="...",
+    ):
+        value = str(text or "")
+
+        if max_width <= 10 or max_height <= 10:
+            return ""
+
+        def _fits(candidate):
+            test_id = canvas.create_text(
+                -10000,
+                -10000,
+                text=candidate,
+                font=font,
+                anchor="nw",
+                width=max_width,
+                justify="left",
+            )
+            bbox = canvas.bbox(test_id)
+            canvas.delete(test_id)
+
+            if bbox is None:
+                return True
+
+            return (bbox[3] - bbox[1]) <= max_height
+
+        if _fits(value):
+            return value
+
+        suffix = str(truncate_suffix or "...")
+        low = 0
+        high = len(value)
+        best = suffix
+
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = value[:middle].rstrip() + suffix
+
+            if _fits(candidate):
+                low = middle
+                best = candidate
+            else:
+                high = middle - 1
+
+        return best
 
     def _toggle_result_sort(sort_key):
         if not search_state["has_searched"]:
@@ -3310,6 +3463,185 @@ def show_search_files_screen(app):
         _draw_results_table()
         _draw_file_details()
 
+    def _refresh_search_results_screen():
+        if search_state["is_searching"] or search_state["is_loading_page"]:
+            return
+
+        search_state["selected_file_ids"].clear()
+        result_table_state["select_all_checked"] = False
+
+        if search_state["has_searched"]:
+            _refresh_search_results_after_open_failure()
+            return
+
+        _run_search()
+
+    def _resolve_unique_download_destination(base_directory, filename, used_names):
+        safe_name = str(filename or "").strip()
+        if not safe_name:
+            safe_name = "downloaded_file"
+
+        base_directory_path = Path(base_directory)
+        initial_path = base_directory_path / safe_name
+        candidate_name = initial_path.name
+        stem = initial_path.stem
+        suffix = initial_path.suffix
+
+        counter = 2
+
+        while True:
+            normalized_name = candidate_name.casefold()
+            candidate_path = base_directory_path / candidate_name
+
+            if normalized_name not in used_names and not candidate_path.exists():
+                used_names.add(normalized_name)
+                return candidate_path
+
+            candidate_name = f"{stem} ({counter}){suffix}"
+            counter += 1
+
+    def _download_selected_checkbox_files():
+        selected_ids = set(
+            int(file_id)
+            for file_id in search_state["selected_file_ids"]
+        )
+
+        if not selected_ids:
+            messagebox.showinfo(
+                "선택 파일 모두 다운로드",
+                "다운로드할 체크박스 선택 파일이 없습니다.",
+                parent=app.root,
+            )
+            return
+
+        current_page_file_ids = _get_current_page_file_ids()
+        target_file_ids = [
+            int(result["file_id"])
+            for result in search_state["results"]
+            if int(result["file_id"]) in selected_ids
+            and int(result["file_id"]) in current_page_file_ids
+        ]
+
+        if not target_file_ids:
+            messagebox.showinfo(
+                "선택 파일 모두 다운로드",
+                "현재 화면에서 체크된 파일이 없습니다.",
+                parent=app.root,
+            )
+            return
+
+        destination_directory = filedialog.askdirectory(
+            parent=app.root,
+            title="선택 파일 저장 위치",
+        )
+
+        if not destination_directory:
+            return
+
+        destination_path = Path(destination_directory)
+
+        if not destination_path.exists() or not destination_path.is_dir():
+            messagebox.showerror(
+                "선택 파일 모두 다운로드",
+                "선택한 저장 위치를 찾을 수 없습니다.",
+                parent=app.root,
+            )
+            return
+
+        try:
+            current_workspace_id = int(workspace_id)
+        except (TypeError, ValueError):
+            messagebox.showerror(
+                "선택 파일 모두 다운로드",
+                "워크스페이스 정보를 확인할 수 없습니다.",
+                parent=app.root,
+            )
+            return
+
+        result_by_file_id = {
+            int(result["file_id"]): result
+            for result in search_state["results"]
+        }
+
+        used_names = {
+            path.name.casefold()
+            for path in destination_path.iterdir()
+            if path.is_file()
+        }
+
+        downloaded_count = 0
+        failed_messages = []
+        needs_refresh = False
+
+        for file_id in target_file_ids:
+            result = result_by_file_id.get(file_id) or {}
+            preferred_name = (
+                str(result.get("original_filename") or "").strip()
+                or str(result.get("archived_filename") or "").strip()
+                or f"file_{file_id}"
+            )
+
+            destination_file = _resolve_unique_download_destination(
+                destination_path,
+                preferred_name,
+                used_names,
+            )
+
+            try:
+                file_operations.copy_file_to(
+                    current_workspace_id,
+                    file_id,
+                    destination_file,
+                    overwrite=False,
+                )
+                downloaded_count += 1
+
+            except (FileNotFoundError, LookupError) as exc:
+                failed_messages.append(
+                    f"- {preferred_name}: {exc}"
+                )
+                needs_refresh = True
+
+            except ConnectionError as exc:
+                failed_messages.append(
+                    f"- {preferred_name}: {exc}"
+                )
+
+            except Exception as exc:
+                failed_messages.append(
+                    f"- {preferred_name}: {type(exc).__name__}: {exc}"
+                )
+
+        if needs_refresh:
+            _refresh_search_results_after_open_failure()
+
+        if failed_messages:
+            summary_lines = [
+                f"성공: {downloaded_count}개",
+                f"실패: {len(failed_messages)}개",
+                "",
+                "실패 상세:",
+            ]
+            summary_lines.extend(failed_messages[:10])
+
+            if len(failed_messages) > 10:
+                summary_lines.append(
+                    f"... 외 {len(failed_messages) - 10}개"
+                )
+
+            messagebox.showerror(
+                "선택 파일 모두 다운로드",
+                "\n".join(summary_lines),
+                parent=app.root,
+            )
+            return
+
+        messagebox.showinfo(
+            "선택 파일 모두 다운로드",
+            f"총 {downloaded_count}개 파일을 다운로드했습니다.",
+            parent=app.root,
+        )
+
     def _open_selected_file():
         selected_result = _get_selected_result()
 
@@ -3374,6 +3706,273 @@ def show_search_files_screen(app):
             messagebox.showerror(
                 "파일 열기",
                 "파일 열기 중 오류가 발생했습니다.\n\n"
+                f"{type(exc).__name__}: {exc}",
+                parent=app.root,
+            )
+
+    def _resolve_selected_file_path(action_title):
+        selected_result = _get_selected_result()
+
+        if selected_result is None:
+            return None
+
+        try:
+            current_workspace_id = int(workspace_id)
+            selected_file_id = int(selected_result["file_id"])
+
+            return file_operations.get_openable_path(
+                current_workspace_id,
+                selected_file_id,
+            )
+
+        except FileNotFoundError as exc:
+            messagebox.showerror(
+                action_title,
+                "파일을 NAS에서 찾을 수 없습니다. 파일 상태가 갱신되었습니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+            _refresh_search_results_after_open_failure()
+
+        except ConnectionError as exc:
+            messagebox.showerror(
+                action_title,
+                "워크스페이스/NAS에 연결할 수 없습니다. 연결 상태를 확인해 주세요.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except LookupError as exc:
+            messagebox.showerror(
+                action_title,
+                "선택한 파일 정보를 찾을 수 없거나 더 이상 활성 상태가 아닙니다.\n"
+                "검색 결과를 새로고침합니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+            _refresh_search_results_after_open_failure()
+
+        except Exception as exc:
+            messagebox.showerror(
+                action_title,
+                "경로 확인 중 오류가 발생했습니다.\n\n"
+                f"{type(exc).__name__}: {exc}",
+                parent=app.root,
+            )
+
+        return None
+
+    def _open_selected_file_folder():
+        selected_path = _resolve_selected_file_path("폴더 열기")
+
+        if selected_path is None:
+            return
+
+        if sys.platform != "win32":
+            messagebox.showerror(
+                "폴더 열기",
+                "현재 환경에서는 폴더 열기를 지원하지 않습니다.",
+                parent=app.root,
+            )
+            return
+
+        try:
+            subprocess.Popen(
+                [
+                    "explorer",
+                    "/select,",
+                    str(selected_path),
+                ]
+            )
+            return
+
+        except OSError:
+            pass
+
+        try:
+            subprocess.Popen(
+                [
+                    "explorer",
+                    str(selected_path.parent),
+                ]
+            )
+
+        except OSError as exc:
+            messagebox.showerror(
+                "폴더 열기",
+                "폴더를 여는 중 운영체제 오류가 발생했습니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "폴더 열기",
+                "폴더 열기 중 오류가 발생했습니다.\n\n"
+                f"{type(exc).__name__}: {exc}",
+                parent=app.root,
+            )
+
+    def _copy_selected_file_path():
+        selected_path = _resolve_selected_file_path("경로 복사")
+
+        if selected_path is None:
+            return
+
+        try:
+            app.root.clipboard_clear()
+            app.root.clipboard_append(str(selected_path))
+            app.root.update_idletasks()
+            messagebox.showinfo(
+                "경로 복사",
+                "파일 경로를 클립보드에 복사했습니다.",
+                parent=app.root,
+            )
+
+        except TclError as exc:
+            messagebox.showerror(
+                "경로 복사",
+                "클립보드에 경로를 복사하지 못했습니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "경로 복사",
+                "경로 복사 중 오류가 발생했습니다.\n\n"
+                f"{type(exc).__name__}: {exc}",
+                parent=app.root,
+            )
+
+    def _download_selected_file():
+        selected_result = _get_selected_result()
+
+        if selected_result is None:
+            return
+
+        selected_path = _resolve_selected_file_path("다운로드")
+
+        if selected_path is None:
+            return
+
+        try:
+            current_workspace_id = int(workspace_id)
+            selected_file_id = int(selected_result["file_id"])
+
+            preferred_filename = str(
+                selected_result.get("original_filename")
+                or selected_path.name
+                or ""
+            ).strip()
+
+            if not preferred_filename:
+                preferred_filename = str(selected_path.name)
+
+            default_extension = Path(preferred_filename).suffix or ""
+
+            destination = filedialog.asksaveasfilename(
+                parent=app.root,
+                title="다운로드 위치 선택",
+                initialfile=preferred_filename,
+                defaultextension=default_extension,
+                filetypes=[("모든 파일", "*.*")],
+                confirmoverwrite=False,
+            )
+
+            if not destination:
+                return
+
+            destination_path = Path(destination)
+            should_overwrite = False
+
+            if destination_path.exists():
+                should_overwrite = messagebox.askyesno(
+                    "다운로드",
+                    "같은 이름의 파일이 이미 존재합니다. 덮어쓰시겠어요?",
+                    parent=app.root,
+                )
+
+                if not should_overwrite:
+                    return
+
+            downloaded_path = file_operations.copy_file_to(
+                current_workspace_id,
+                selected_file_id,
+                destination_path,
+                overwrite=should_overwrite,
+            )
+
+            messagebox.showinfo(
+                "다운로드",
+                "파일 다운로드가 완료되었습니다.\n\n"
+                f"{downloaded_path}",
+                parent=app.root,
+            )
+
+        except FileNotFoundError as exc:
+            messagebox.showerror(
+                "다운로드",
+                "파일을 NAS에서 찾을 수 없습니다. 파일 상태가 갱신되었습니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+            _refresh_search_results_after_open_failure()
+
+        except ConnectionError as exc:
+            messagebox.showerror(
+                "다운로드",
+                "워크스페이스/NAS에 연결할 수 없습니다. 연결 상태를 확인해 주세요.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except LookupError as exc:
+            messagebox.showerror(
+                "다운로드",
+                "선택한 파일 정보를 찾을 수 없거나 더 이상 활성 상태가 아닙니다.\n"
+                "검색 결과를 새로고침합니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+            _refresh_search_results_after_open_failure()
+
+        except PermissionError as exc:
+            messagebox.showerror(
+                "다운로드",
+                "선택한 위치에 파일을 저장할 권한이 없습니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except FileExistsError as exc:
+            messagebox.showerror(
+                "다운로드",
+                "대상 위치에 같은 파일이 이미 존재합니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except NotADirectoryError as exc:
+            messagebox.showerror(
+                "다운로드",
+                "선택한 저장 위치가 올바른 폴더가 아닙니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except OSError as exc:
+            messagebox.showerror(
+                "다운로드",
+                "파일 저장 중 운영체제 오류가 발생했습니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "다운로드",
+                "다운로드 중 오류가 발생했습니다.\n\n"
                 f"{type(exc).__name__}: {exc}",
                 parent=app.root,
             )
@@ -3749,6 +4348,12 @@ def show_search_files_screen(app):
         text,
         tag,
         command,
+        icon=None,
+        fill=colors.SURFACE_ALT,
+        outline=SF_BORDER,
+        text_color=SF_TEXT_DARK,
+        hover_fill=SF_SURFACE_HOVER_SOFT,
+        hover_outline=SF_BORDER,
     ):
         text_font = app._font(9, "bold")
 
@@ -3768,7 +4373,10 @@ def show_search_files_screen(app):
             else 60
         )
 
-        button_width = text_width + 24
+        icon_width = icon.width() if icon is not None else 0
+        icon_gap = 6 if icon is not None else 0
+
+        button_width = text_width + icon_width + icon_gap + 24
         button_height = 28
 
         x1 = x
@@ -3776,25 +4384,38 @@ def show_search_files_screen(app):
         x2 = x1 + button_width
         y2 = center_y + button_height / 2.0
 
-        _draw_plain_rounded_rect(
+        background_shape = app._smooth_rounded_rect(
             canvas,
             x1,
             y1,
             x2,
             y2,
             8,
-            fill=colors.SURFACE_ALT,
-            outline=SF_BORDER,
-            border_width=1,
+            fill=fill,
+            outline=outline,
+            width=1,
+            tags=(tag, f"{tag}_bg"),
         )
 
+        content_center_x = (x1 + x2) / 2.0
+        content_left = content_center_x - ((text_width + icon_width + icon_gap) / 2.0)
+
+        if icon is not None:
+            canvas.create_image(
+                content_left,
+                center_y,
+                image=icon,
+                anchor="w",
+                tags=(tag,),
+            )
+
         canvas.create_text(
-            (x1 + x2) / 2.0,
+            content_left + icon_width + icon_gap,
             center_y,
             text=text,
-            fill=SF_TEXT_DARK,
+            fill=text_color,
             font=text_font,
-            anchor="center",
+            anchor="w",
             tags=(tag,),
         )
 
@@ -3816,14 +4437,18 @@ def show_search_files_screen(app):
         canvas.tag_bind(
             tag,
             "<Enter>",
-            lambda _event:
+            lambda _event: (
+                canvas.itemconfigure(background_shape, fill=hover_fill, outline=hover_outline),
                 canvas.configure(cursor="hand2"),
+            ),
         )
         canvas.tag_bind(
             tag,
             "<Leave>",
-            lambda _event:
+            lambda _event: (
+                canvas.itemconfigure(background_shape, fill=fill, outline=outline),
                 canvas.configure(cursor=""),
+            ),
         )
 
         return x2
@@ -3965,6 +4590,84 @@ def show_search_files_screen(app):
             )
             title_tail_x = badge_right
 
+        if show_result_count_badge:
+            reset_tag = "sf_results_reset_button"
+            reset_hit_size = 24
+            reset_center_x = title_tail_x + 8 + (reset_hit_size / 2.0)
+            reset_left = reset_center_x - (reset_hit_size / 2.0)
+            reset_top = title_center_y - (reset_hit_size / 2.0)
+            reset_right = reset_center_x + (reset_hit_size / 2.0)
+            reset_bottom = title_center_y + (reset_hit_size / 2.0)
+
+            reset_hover_id = card_canvas.create_rectangle(
+                reset_left,
+                reset_top,
+                reset_right,
+                reset_bottom,
+                fill=colors.SURFACE_ALT,
+                outline="",
+                tags=(f"{reset_tag}_hover",),
+            )
+
+            if result_reset_icon_photo is not None:
+                card_canvas.create_image(
+                    reset_center_x,
+                    title_center_y,
+                    image=result_reset_icon_photo,
+                    anchor="center",
+                    tags=(reset_tag,),
+                )
+            else:
+                card_canvas.create_text(
+                    reset_center_x,
+                    title_center_y,
+                    text="R",
+                    fill=SF_TEXT_DARK,
+                    font=app._font(10, "bold"),
+                    anchor="center",
+                    tags=(reset_tag,),
+                )
+
+            card_canvas.create_rectangle(
+                reset_left,
+                reset_top,
+                reset_right,
+                reset_bottom,
+                fill="",
+                outline="",
+                tags=(reset_tag,),
+            )
+
+            card_canvas.tag_bind(
+                reset_tag,
+                "<Enter>",
+                lambda _event: (
+                    card_canvas.itemconfigure(
+                        reset_hover_id,
+                        fill=SF_SURFACE_HOVER_SOFT,
+                    ),
+                    card_canvas.configure(cursor="hand2"),
+                ),
+            )
+            card_canvas.tag_bind(
+                reset_tag,
+                "<Leave>",
+                lambda _event: (
+                    card_canvas.itemconfigure(
+                        reset_hover_id,
+                        fill=colors.SURFACE_ALT,
+                    ),
+                    card_canvas.configure(cursor=""),
+                ),
+            )
+            card_canvas.tag_bind(
+                reset_tag,
+                "<Button-1>",
+                lambda _event: _refresh_search_results_screen(),
+            )
+
+            card_canvas.tag_raise(reset_tag)
+
         if search_state["is_loading_page"]:
             card_canvas.create_text(
                 inner_x2 - 12,
@@ -3985,9 +4688,10 @@ def show_search_files_screen(app):
 
             toolbar_specs = [
                 (
-                    "선택 해제",
-                    "sf_clear_selection",
-                    _clear_result_selection,
+                    "선택 파일 모두 다운로드",
+                    "sf_download_selected",
+                    _download_selected_checkbox_files,
+                    toolbar_download_blue_icon_photo,
                 ),
             ]
 
@@ -4007,12 +4711,13 @@ def show_search_files_screen(app):
                         "현재 페이지 선택",
                         "sf_select_page",
                         _select_current_result_page,
+                        None,
                     ),
                 )
 
             button_measurements = []
 
-            for text, tag, command in toolbar_specs:
+            for text, tag, command, icon in toolbar_specs:
                 measure_id = card_canvas.create_text(
                     -10000,
                     -10000,
@@ -4029,8 +4734,11 @@ def show_search_files_screen(app):
                     else 60
                 )
 
+                icon_width = icon.width() if icon is not None else 0
+                icon_gap = 6 if icon is not None else 0
+
                 button_measurements.append(
-                    text_width + 24
+                    text_width + icon_width + icon_gap + 24
                 )
 
             toolbar_width = sum(button_measurements)
@@ -4041,7 +4749,8 @@ def show_search_files_screen(app):
 
             toolbar_x = toolbar_right - toolbar_width
 
-            for text, tag, command in toolbar_specs:
+            for text, tag, command, icon in toolbar_specs:
+                is_download_button = tag == "sf_download_selected"
                 toolbar_x = _draw_selection_toolbar_button(
                     card_canvas,
                     x=toolbar_x,
@@ -4049,6 +4758,32 @@ def show_search_files_screen(app):
                     text=text,
                     tag=tag,
                     command=command,
+                    icon=icon,
+                    fill=(
+                        colors.SURFACE_ALT
+                        if is_download_button
+                        else colors.SURFACE_ALT
+                    ),
+                    outline=(
+                        SF_PRIMARY
+                        if is_download_button
+                        else SF_BORDER
+                    ),
+                    text_color=(
+                        SF_PRIMARY
+                        if is_download_button
+                        else SF_TEXT_DARK
+                    ),
+                    hover_fill=(
+                        colors.SURFACE_ACCENT_SOFT
+                        if is_download_button
+                        else SF_SURFACE_HOVER_SOFT
+                    ),
+                    hover_outline=(
+                        SF_PRIMARY
+                        if is_download_button
+                        else SF_BORDER
+                    ),
                 )
                 toolbar_x += toolbar_gap
 
@@ -4806,6 +5541,8 @@ def show_search_files_screen(app):
         canvas = right_card
         canvas.delete("all")
 
+        detail_title_font = app._font(13, "bold")
+
         canvas_width = max(
             100,
             canvas.winfo_width(),
@@ -4850,20 +5587,20 @@ def show_search_files_screen(app):
                 card_y1 + 22,
                 text="파일 상세 정보",
                 fill=SF_TEXT_MAIN,
-                font=app._font(14, "bold"),
+                font=detail_title_font,
                 anchor="nw",
             )
 
             canvas.create_text(
-                inner_x,
-                card_y1 + 58,
+                (card_x1 + card_x2) / 2.0,
+                (card_y1 + card_y2) / 2.0,
                 text=(
-                    "검색 결과에서 파일을 \n선택하면 상세 정보가 \n여기에 표시돼요"
+                    "검색 결과에서 파일을 선택하면 상세 정보가 여기에 표시돼요"
                 ),
                 fill=SF_TEXT_PLACEHOLDER,
-                font=app._font(11),
-                justify="left",
-                anchor="nw",
+                font=app._font(10),
+                justify="center",
+                anchor="center",
                 width=max(80, inner_width),
             )
             return
@@ -4875,10 +5612,10 @@ def show_search_files_screen(app):
             y_cursor,
             text="파일 상세 정보",
             fill=SF_TEXT_MAIN,
-            font=app._font(14, "bold"),
+            font=detail_title_font,
             anchor="nw",
         )
-        y_cursor += 42
+        y_cursor += 34
 
         canvas.create_line(
             inner_x,
@@ -4888,199 +5625,378 @@ def show_search_files_screen(app):
             fill=SF_BORDER,
             width=1,
         )
-        y_cursor += 20
+        y_cursor += 14
 
-        y_cursor = _draw_detail_field(
+        header_icon_size = 18
+        header_icon_gap = 10
+        header_text_x = inner_x + header_icon_size + header_icon_gap
+        header_text_width = max(
+            20,
+            (card_x2 - 20) - header_text_x,
+        )
+        header_text_font = app._font(12, "bold")
+        header_line_height = tkfont.Font(font=header_text_font).metrics("linespace")
+        header_max_height = max(header_line_height, (header_line_height * 2) + 2)
+
+        original_filename_text = _truncate_canvas_multiline_text(
             canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="원본 파일명",
-            value=selected_result.get(
-                "original_filename"
+            _format_detail_value(
+                selected_result.get("original_filename")
             ),
-            value_font=app._font(11, "bold"),
+            header_text_width,
+            header_max_height,
+            header_text_font,
+            truncate_suffix="...",
         )
 
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="보관 파일명",
-            value=selected_result.get(
-                "archived_filename"
-            ),
+        header_file_type_key = _pick_file_format_icon_key(
+            selected_result.get("file_ext")
         )
+        header_icon = detail_file_format_icons.get(
+            header_file_type_key
+        ) or detail_file_format_icons.get("file")
 
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="문서 유형",
-            value=selected_result.get(
-                "document_type"
-            ),
-        )
-
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="문서 날짜",
-            value=selected_result.get(
-                "document_date"
-            ),
-        )
-
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="업로드한 사람",
-            value=selected_result.get(
-                "uploaded_by"
-            ),
-        )
-
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="업로드 날짜",
-            value=_format_archived_at(
-                selected_result.get("archived_at")
-            ),
-        )
-
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="파일 종류",
-            value=_format_file_type_label(
-                selected_result.get("file_ext")
-            ),
-        )
-
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="파일 크기",
-            value=_format_file_size(
-                selected_result.get("file_size")
-            ),
-        )
-
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="태그",
-            value=selected_result.get("tags"),
-        )
-
-        y_cursor = _draw_detail_field(
-            canvas,
-            x=inner_x,
-            y=y_cursor,
-            width=inner_width,
-            label="보관 경로",
-            value=selected_result.get(
-                "relative_path"
-            ),
-        )
-
-        button_height = 42
-        button_x1 = inner_x
-        button_x2 = card_x2 - 20
-
-        button_y1 = max(
-            y_cursor + 10,
-            card_y2 - 20 - button_height,
-        )
-        button_y2 = button_y1 + button_height
-
-        if button_y2 > card_y2 - 8:
-            button_y2 = card_y2 - 8
-            button_y1 = button_y2 - button_height
-
-        button_tag = "sf_detail_open_button"
-        button_fill = SF_PRIMARY
-        button_hover_fill = colors.PRIMARY_HOVER
-
-        button_shape = app._smooth_rounded_rect(
-            canvas,
-            button_x1,
-            button_y1,
-            button_x2,
-            button_y2,
-            10,
-            fill=button_fill,
-            outline=button_fill,
-            width=1,
-            tags=(button_tag,),
-        )
-
-        canvas.create_text(
-            (button_x1 + button_x2) / 2.0,
-            (button_y1 + button_y2) / 2.0,
-            text="파일 열기",
-            fill=colors.TEXT_INVERSE,
-            font=app._font(11, "bold"),
-            anchor="center",
-            tags=(button_tag,),
-        )
-
-        canvas.create_rectangle(
-            button_x1,
-            button_y1,
-            button_x2,
-            button_y2,
-            fill="",
-            outline="",
-            tags=(button_tag,),
-        )
-
-        def _on_open_button_enter(_event=None):
-            canvas.itemconfigure(
-                button_shape,
-                fill=button_hover_fill,
-                outline=button_hover_fill,
+        if header_icon is not None:
+            canvas.create_image(
+                inner_x,
+                y_cursor + 1,
+                image=header_icon,
+                anchor="nw",
             )
-            canvas.configure(cursor="hand2")
 
-        def _on_open_button_leave(_event=None):
-            canvas.itemconfigure(
-                button_shape,
-                fill=button_fill,
-                outline=button_fill,
+        original_filename_id = canvas.create_text(
+            header_text_x,
+            y_cursor,
+            text=original_filename_text,
+            fill=SF_TEXT_MAIN,
+            font=header_text_font,
+            anchor="nw",
+            width=header_text_width,
+            justify="left",
+        )
+
+        original_filename_bbox = canvas.bbox(original_filename_id)
+        icon_bottom = y_cursor + header_icon_size
+        text_bottom = y_cursor
+
+        if original_filename_bbox is not None:
+            text_bottom = original_filename_bbox[3]
+
+        y_cursor = max(icon_bottom, text_bottom) + 18
+
+        # Keep label/value keys explicit for future pill-style rendering upgrades.
+        metadata_rows = [
+            {
+                "label": "문서 유형",
+                "value": _format_detail_value(selected_result.get("document_type")),
+                "wrap_lines": 1,
+            },
+            {
+                "label": "문서 날짜",
+                "value": _format_detail_value(selected_result.get("document_date")),
+                "wrap_lines": 1,
+            },
+            {
+                "label": "파일 종류",
+                "value": _format_file_type_label(selected_result.get("file_ext")),
+                "wrap_lines": 1,
+            },
+            {
+                "label": "업로더",
+                "value": _format_detail_value(selected_result.get("uploaded_by")),
+                "wrap_lines": 1,
+            },
+            {
+                "label": "업로드 날짜",
+                "value": _format_archived_at(selected_result.get("archived_at")),
+                "wrap_lines": 1,
+            },
+            {
+                "label": "크기",
+                "value": _format_file_size(selected_result.get("file_size")),
+                "wrap_lines": 1,
+            },
+            {
+                "label": "저장 파일명",
+                "value": _format_detail_value(selected_result.get("archived_filename")),
+                "wrap_lines": 2,
+            },
+            {
+                "label": "저장 경로",
+                "value": _format_detail_value(selected_result.get("relative_path")),
+                "wrap_lines": 3,
+            },
+            {
+                "label": "태그",
+                "value": _format_detail_value(selected_result.get("tags")),
+                "wrap_lines": 2,
+            },
+        ]
+
+        label_font = app._font(9, "bold")
+        value_font = app._font(10)
+        label_col_width = 80
+        row_gap = 7
+
+        label_x = inner_x
+        value_x = inner_x + label_col_width
+        right_edge_x = card_x2 - 20
+        value_col_width = max(40, right_edge_x - value_x)
+        line_height = tkfont.Font(font=value_font).metrics("linespace")
+
+        for row in metadata_rows:
+            label_id = canvas.create_text(
+                label_x,
+                y_cursor,
+                text=row["label"],
+                fill=SF_TEXT_PLACEHOLDER,
+                font=label_font,
+                anchor="nw",
             )
-            canvas.configure(cursor="")
 
-        canvas.tag_bind(
-            button_tag,
-            "<Enter>",
-            _on_open_button_enter,
+            wrap_lines = int(row.get("wrap_lines", 1) or 1)
+            raw_value_text = _format_detail_value(row.get("value"))
+
+            if wrap_lines <= 1:
+                value_text = _truncate_canvas_text(
+                    canvas,
+                    raw_value_text,
+                    value_col_width,
+                    value_font,
+                    truncate_suffix="...",
+                )
+                value_id = canvas.create_text(
+                    value_x,
+                    y_cursor,
+                    text=value_text,
+                    fill=SF_TEXT_DARK,
+                    font=value_font,
+                    anchor="nw",
+                    justify="left",
+                )
+            else:
+                max_height = max(line_height, (line_height * wrap_lines) + 2)
+                value_text = _truncate_canvas_multiline_text(
+                    canvas,
+                    raw_value_text,
+                    value_col_width,
+                    max_height,
+                    value_font,
+                    truncate_suffix="...",
+                )
+                value_id = canvas.create_text(
+                    value_x,
+                    y_cursor,
+                    text=value_text,
+                    fill=SF_TEXT_DARK,
+                    font=value_font,
+                    anchor="nw",
+                    width=value_col_width,
+                    justify="left",
+                )
+
+            label_bbox = canvas.bbox(label_id)
+            value_bbox = canvas.bbox(value_id)
+
+            label_bottom = y_cursor
+            value_bottom = y_cursor
+
+            if label_bbox is not None:
+                label_bottom = label_bbox[3]
+            if value_bbox is not None:
+                value_bottom = value_bbox[3]
+
+            y_cursor = max(label_bottom, value_bottom) + row_gap
+
+        base_button_width = max(80, card_x2 - inner_x - 20)
+        button_side_margin = 8
+        max_button_width = max(
+            80,
+            int((card_x2 - card_x1) - (button_side_margin * 2)),
         )
-        canvas.tag_bind(
-            button_tag,
-            "<Leave>",
-            _on_open_button_leave,
+        button_width = min(
+            max_button_width,
+            max(80, int(round(base_button_width * 1.045))),
         )
-        canvas.tag_bind(
-            button_tag,
-            "<Button-1>",
-            lambda _event: _open_selected_file(),
+        button_height = 32
+        button_gap = 10
+        button_radius = 10
+        button_label_font = app._font(10, "bold")
+
+        action_buttons = [
+            {
+                "tag": "sf_detail_open_button",
+                "label": "파일 열기",
+                "icon": open_file_button_icon,
+                "fill": SF_PRIMARY,
+                "outline": SF_PRIMARY,
+                "text_color": colors.TEXT_INVERSE,
+                "hover_fill": colors.PRIMARY_HOVER,
+                "hover_outline": colors.PRIMARY_HOVER,
+                "command": _open_selected_file,
+            },
+            {
+                "tag": "sf_detail_download_button",
+                "label": "다운로드",
+                "icon": download_button_icon,
+                "fill": SF_PRIMARY,
+                "outline": SF_PRIMARY,
+                "text_color": colors.TEXT_INVERSE,
+                "hover_fill": colors.PRIMARY_HOVER,
+                "hover_outline": colors.PRIMARY_HOVER,
+                "command": _download_selected_file,
+            },
+            {
+                "tag": "sf_detail_open_folder_button",
+                "label": "폴더 열기",
+                "icon": open_folder_button_icon,
+                "fill": colors.SURFACE_ALT,
+                "outline": SF_PRIMARY,
+                "text_color": SF_PRIMARY,
+                "hover_fill": colors.SURFACE_ACCENT_SOFT,
+                "hover_outline": SF_PRIMARY,
+                "command": _open_selected_file_folder,
+            },
+            {
+                "tag": "sf_detail_copy_path_button",
+                "label": "경로 복사",
+                "icon": copy_path_button_icon,
+                "fill": colors.SURFACE_ALT,
+                "outline": SF_PRIMARY,
+                "text_color": SF_PRIMARY,
+                "hover_fill": colors.SURFACE_ACCENT_SOFT,
+                "hover_outline": SF_PRIMARY,
+                "command": _copy_selected_file_path,
+            },
+        ]
+
+        stack_height = (
+            (button_height * len(action_buttons))
+            + (button_gap * (len(action_buttons) - 1))
         )
+
+        stack_y1 = max(
+            y_cursor + 12,
+            card_y2 - 20 - stack_height,
+        )
+        stack_y2 = stack_y1 + stack_height
+
+        if stack_y2 > card_y2 - 8:
+            stack_y2 = card_y2 - 8
+            stack_y1 = stack_y2 - stack_height
+
+        button_x1 = card_x1 + ((card_x2 - card_x1) - button_width) / 2.0
+        button_x2 = button_x1 + button_width
+
+        def _draw_detail_action_button(
+            *,
+            tag,
+            x1,
+            y1,
+            x2,
+            y2,
+            label,
+            icon,
+            fill,
+            outline,
+            text_color,
+            hover_fill,
+            hover_outline,
+            command,
+        ):
+            button_shape = app._smooth_rounded_rect(
+                canvas,
+                x1,
+                y1,
+                x2,
+                y2,
+                button_radius,
+                fill=fill,
+                outline=outline,
+                width=1,
+                tags=(tag,),
+            )
+
+            center_x = (x1 + x2) / 2.0
+            center_y = (y1 + y2) / 2.0
+            text_width = tkfont.Font(font=button_label_font).measure(label)
+            icon_width = icon.width() if icon is not None else 0
+            icon_gap = 8 if icon is not None else 0
+            content_width = icon_width + icon_gap + text_width
+            content_left = center_x - (content_width / 2.0)
+
+            if icon is not None:
+                canvas.create_image(
+                    content_left,
+                    center_y,
+                    image=icon,
+                    anchor="w",
+                    tags=(tag,),
+                )
+
+            canvas.create_text(
+                content_left + icon_width + icon_gap,
+                center_y,
+                text=label,
+                fill=text_color,
+                font=button_label_font,
+                anchor="w",
+                tags=(tag,),
+            )
+
+            canvas.create_rectangle(
+                x1,
+                y1,
+                x2,
+                y2,
+                fill="",
+                outline="",
+                tags=(tag,),
+            )
+
+            def _on_enter(_event=None):
+                canvas.itemconfigure(
+                    button_shape,
+                    fill=hover_fill,
+                    outline=hover_outline,
+                )
+                canvas.configure(cursor="hand2")
+
+            def _on_leave(_event=None):
+                canvas.itemconfigure(
+                    button_shape,
+                    fill=fill,
+                    outline=outline,
+                )
+                canvas.configure(cursor="")
+
+            canvas.tag_bind(tag, "<Enter>", _on_enter)
+            canvas.tag_bind(tag, "<Leave>", _on_leave)
+            canvas.tag_bind(
+                tag,
+                "<Button-1>",
+                lambda _event: command(),
+            )
+
+        for index, spec in enumerate(action_buttons):
+            current_y1 = stack_y1 + (index * (button_height + button_gap))
+            current_y2 = current_y1 + button_height
+
+            _draw_detail_action_button(
+                tag=spec["tag"],
+                x1=button_x1,
+                y1=current_y1,
+                x2=button_x2,
+                y2=current_y2,
+                label=spec["label"],
+                icon=spec["icon"],
+                fill=spec["fill"],
+                outline=spec["outline"],
+                text_color=spec["text_color"],
+                hover_fill=spec["hover_fill"],
+                hover_outline=spec["hover_outline"],
+                command=spec["command"],
+            )
 
     def _draw_search_box():
         top_card_width = max(100, left_top_card.winfo_width())
