@@ -163,13 +163,34 @@ class SequenceArchiverApp:
         font_path = config.PROJECT_ROOT / "assets" / "fonts" / "PretendardVariable.ttf"
 
         if os.name == "nt" and font_path.exists():
+            added = 0
             try:
                 FR_PRIVATE = 0x10
                 added = ctypes.windll.gdi32.AddFontResourceExW(str(font_path), FR_PRIVATE, 0)
-                if added > 0:
-                    ctypes.windll.user32.SendMessageW(0xFFFF, 0x001D, 0, 0)
             except Exception:
                 pass
+
+            if added > 0:
+                HWND_BROADCAST = 0xFFFF
+                WM_FONTCHANGE = 0x001D
+                SMTO_ABORTIFHUNG = 0x0002
+                timeout_ms = 1000
+                result = ctypes.c_size_t()
+
+                # Avoid startup hangs if another top-level Windows process
+                # is not responding to WM_FONTCHANGE.
+                try:
+                    ctypes.windll.user32.SendMessageTimeoutW(
+                        HWND_BROADCAST,
+                        WM_FONTCHANGE,
+                        0,
+                        0,
+                        SMTO_ABORTIFHUNG,
+                        timeout_ms,
+                        ctypes.byref(result),
+                    )
+                except Exception:
+                    pass
 
         try:
             families = set(tkfont.families(self.root))
