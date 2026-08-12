@@ -222,25 +222,57 @@ class DocumentTypeBackendTests(unittest.TestCase):
                 int(fallback["id"]),
             )
 
-    def test_g_deactivate_fails_when_active_file_references_type(self):
+    def test_g_deactivate_preserves_active_file_reference(self):
         contracts = self.database.create_document_type(
             self.workspace_id,
             "Contracts",
         )
+        contracts_id = int(contracts["id"])
 
-        self._insert_active_file(
-            document_type_id=int(contracts["id"]),
+        file_id = self._insert_active_file(
+            document_type_id=contracts_id,
             archived_filename="contracts-active-ref.pdf",
         )
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "^Document type is still used by active files\\.$",
-        ):
-            self.database.deactivate_document_type(
-                self.workspace_id,
-                int(contracts["id"]),
+        deactivated = self.database.deactivate_document_type(
+            self.workspace_id,
+            contracts_id,
+        )
+
+        self.assertEqual(
+            int(deactivated["id"]),
+            contracts_id,
+        )
+        self.assertFalse(deactivated["is_active"])
+        self.assertIsNotNone(deactivated["deleted_at"])
+
+        refreshed = self.database.get_document_type(
+            self.workspace_id,
+            contracts_id,
+        )
+
+        self.assertIsNotNone(refreshed)
+        self.assertFalse(refreshed["is_active"])
+        self.assertIsNotNone(refreshed["deleted_at"])
+
+        file_record = self.database.get_file_by_id(
+            self.workspace_id,
+            file_id,
+        )
+
+        self.assertIsNotNone(file_record)
+        self.assertEqual(
+            int(file_record["document_type_id"]),
+            contracts_id,
+        )
+        self.assertEqual(file_record["status"], "active")
+
+        self.assertTrue(
+            any(
+                int(row["id"]) == contracts_id
+                for row in self._all_rows()
             )
+        )
 
     def test_h_reorder_persists_requested_order(self):
         self.database.create_document_type(
