@@ -3,9 +3,12 @@ import tkinter as tk
 import tkinter.font as tkfont
 from calendar import monthrange
 from datetime import date, datetime, timedelta
-from tkinter import TclError
+from pathlib import Path
+import re
+from tkinter import TclError, messagebox
 import applemango_dms.config as config
 import applemango_dms.state as state
+from applemango_dms.services.file_operations import FileOperationsService
 from applemango_dms.ui.workplace_menu import render_workspace_sidebar_nav
 from applemango_dms.ui.widgets import RoundedInput
 
@@ -25,6 +28,8 @@ SF_SURFACE = colors.SURFACE_ALT
 SF_BORDER = colors.BORDER_LIGHT
 SF_SEARCH_BOX_BORDER = "#5C667F"
 SF_SURFACE_HOVER_SOFT = colors.SURFACE_HOVER_SOFT
+SF_RESULT_ROW_HOVER_BG = colors.SURFACE_ALT2
+SF_RESULT_ROW_SELECTED_BG = colors.SURFACE_ALT2
 SF_STATUS_PROCESSING = colors.PROCESSING
 SF_TEXT_DARK = colors.TEXT_NEUTRAL_DARK
 SF_TEXT_MAIN = colors.TEXT_EMPHASIS
@@ -51,6 +56,81 @@ SF_CALENDAR_WEEKDAYS = (
     "토",
     "일",
 )
+
+
+def _parse_svg_dimension(raw_text):
+    text = str(raw_text or "").strip().lower()
+
+    if not text:
+        return None
+
+    if text.endswith("px"):
+        text = text[:-2].strip()
+
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)", text)
+    if not match:
+        return None
+
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+
+    if value <= 0:
+        return None
+
+    return max(1, int(round(value)))
+
+
+def _extract_svg_attr(svg_text, attr_name):
+    patterns = (
+        rf"\b{attr_name}\s*=\s*\"([^\"]+)\"",
+        rf"\b{attr_name}\s*=\s*'([^']+)'",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, svg_text, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1)).strip()
+
+    return None
+
+
+def _read_svg_intrinsic_size(icon_path):
+    fallback_width = 24
+    fallback_height = 24
+
+    try:
+        source = Path(icon_path).read_text(encoding="utf-8")
+    except Exception:
+        return fallback_width, fallback_height
+
+    width = _parse_svg_dimension(_extract_svg_attr(source, "width"))
+    height = _parse_svg_dimension(_extract_svg_attr(source, "height"))
+
+    view_box_text = _extract_svg_attr(source, "viewBox")
+    if view_box_text:
+        parts = re.split(r"\s+|,", view_box_text.strip())
+        if len(parts) == 4:
+            try:
+                vb_width = float(parts[2])
+                vb_height = float(parts[3])
+                if vb_width > 0 and width is None:
+                    width = int(round(vb_width))
+                if vb_height > 0 and height is None:
+                    height = int(round(vb_height))
+            except ValueError:
+                pass
+
+    if width is None and height is None:
+        return fallback_width, fallback_height
+
+    if width is None:
+        width = height
+    if height is None:
+        height = width
+
+    return max(1, int(width)), max(1, int(height))
 
 def show_search_files_screen(app):
     shell = app._create_workspace_shell()
@@ -141,45 +221,63 @@ def show_search_files_screen(app):
         max_width=14,
         max_height=14,
     )
-    far_before_icon_photo = load_svg_photo(
+    far_before_icon_path = (
         config.PROJECT_ROOT
         / "assets"
         / "icons"
         / "workspace"
         / "search_files"
-        / "far_before.svg",
-        max_width=16,
-        max_height=16,
+        / "far_before.svg"
+    )
+    before_icon_path = (
+        config.PROJECT_ROOT
+        / "assets"
+        / "icons"
+        / "workspace"
+        / "search_files"
+        / "before.svg"
+    )
+    after_icon_path = (
+        config.PROJECT_ROOT
+        / "assets"
+        / "icons"
+        / "workspace"
+        / "search_files"
+        / "after.svg"
+    )
+    far_after_icon_path = (
+        config.PROJECT_ROOT
+        / "assets"
+        / "icons"
+        / "workspace"
+        / "search_files"
+        / "far_after.svg"
+    )
+
+    far_before_w, far_before_h = _read_svg_intrinsic_size(far_before_icon_path)
+    before_w, before_h = _read_svg_intrinsic_size(before_icon_path)
+    after_w, after_h = _read_svg_intrinsic_size(after_icon_path)
+    far_after_w, far_after_h = _read_svg_intrinsic_size(far_after_icon_path)
+
+    far_before_icon_photo = load_svg_photo(
+        far_before_icon_path,
+        max_width=far_before_w,
+        max_height=far_before_h,
     )
     before_icon_photo = load_svg_photo(
-        config.PROJECT_ROOT
-        / "assets"
-        / "icons"
-        / "workspace"
-        / "search_files"
-        / "before.svg",
-        max_width=16,
-        max_height=16,
+        before_icon_path,
+        max_width=before_w,
+        max_height=before_h,
     )
     after_icon_photo = load_svg_photo(
-        config.PROJECT_ROOT
-        / "assets"
-        / "icons"
-        / "workspace"
-        / "search_files"
-        / "after.svg",
-        max_width=16,
-        max_height=16,
+        after_icon_path,
+        max_width=after_w,
+        max_height=after_h,
     )
     far_after_icon_photo = load_svg_photo(
-        config.PROJECT_ROOT
-        / "assets"
-        / "icons"
-        / "workspace"
-        / "search_files"
-        / "far_after.svg",
-        max_width=16,
-        max_height=16,
+        far_after_icon_path,
+        max_width=far_after_w,
+        max_height=far_after_h,
     )
 
     filter_row = tk.Frame(left_top_card, bg=colors.SURFACE_ALT, highlightthickness=0, bd=0)
@@ -247,6 +345,7 @@ def show_search_files_screen(app):
     doc_type_options = []
 
     workspace_id = getattr(state, "active_workspace_id", None)
+    file_operations = FileOperationsService(app.db)
 
     try:
         document_type_records = app.db.get_document_types(
@@ -364,6 +463,12 @@ def show_search_files_screen(app):
         if not board.winfo_exists():
             return
 
+        if (
+            search_state["selected_file_id"] is not None
+            and not _is_result_row_click_event(event)
+        ):
+            _clear_detail_selection()
+
         calendar_popup = calendar_popup_state.get(
             "popup"
         )
@@ -419,6 +524,46 @@ def show_search_files_screen(app):
             False,
         )
         _close_calendar_popup()
+
+    def _is_result_row_click_event(event):
+        widget = getattr(event, "widget", None)
+        if widget is not left_bottom_card:
+            return False
+
+        try:
+            current_items = widget.find_withtag("current")
+        except TclError:
+            return False
+
+        hit_items = list(current_items)
+
+        # After a row click, the table is re-drawn immediately, so the
+        # transient Tk "current" tag may be empty by the time the root-level
+        # click handler runs. Fall back to geometry hit-testing at the click
+        # coordinates to preserve row selection behavior.
+        if not hit_items:
+            try:
+                click_x = int(getattr(event, "x", -1))
+                click_y = int(getattr(event, "y", -1))
+                if click_x >= 0 and click_y >= 0:
+                    hit_items = list(
+                        widget.find_overlapping(
+                            click_x,
+                            click_y,
+                            click_x,
+                            click_y,
+                        )
+                    )
+            except (TclError, TypeError, ValueError):
+                hit_items = []
+
+        for item_id in hit_items:
+            tags = widget.gettags(item_id)
+            for tag in tags:
+                if tag.startswith("sf_result_row_") or tag.startswith("sf_result_check_"):
+                    return True
+
+        return False
 
     def _start_search_placeholder():
         search_text_entry.focus_set()
@@ -808,6 +953,22 @@ def show_search_files_screen(app):
         field_name,
         is_end_date,
     ):
+        today_value = date.today()
+
+        def _clamp_to_today(iso_text):
+            try:
+                parsed_date = datetime.strptime(
+                    iso_text,
+                    "%Y-%m-%d",
+                ).date()
+            except ValueError:
+                return iso_text
+
+            if parsed_date > today_value:
+                return today_value.isoformat()
+
+            return iso_text
+
         text = str(value or "").strip()
 
         if not text or text == "-":
@@ -823,9 +984,13 @@ def show_search_files_screen(app):
                     raise ValueError
 
                 if is_end_date:
-                    return f"{year_value:04d}-12-31"
+                    return _clamp_to_today(
+                        f"{year_value:04d}-12-31"
+                    )
 
-                return f"{year_value:04d}-01-01"
+                return _clamp_to_today(
+                    f"{year_value:04d}-01-01"
+                )
 
             if len(parts) == 2:
                 year_value = int(parts[0])
@@ -843,13 +1008,13 @@ def show_search_files_screen(app):
                         month_value,
                     )[1]
 
-                    return (
+                    return _clamp_to_today(
                         f"{year_value:04d}-"
                         f"{month_value:02d}-"
                         f"{final_day:02d}"
                     )
 
-                return (
+                return _clamp_to_today(
                     f"{year_value:04d}-"
                     f"{month_value:02d}-01"
                 )
@@ -873,7 +1038,7 @@ def show_search_files_screen(app):
                 if not 1 <= day_value <= final_day:
                     raise ValueError
 
-                return (
+                return _clamp_to_today(
                     f"{year_value:04d}-"
                     f"{month_value:02d}-"
                     f"{day_value:02d}"
@@ -916,7 +1081,28 @@ def show_search_files_screen(app):
         return normalized_from, normalized_to
 
     def normalize_date_input(raw_value):
+        today_value = date.today()
         current_year = 9999
+        today_iso = today_value.isoformat()
+        today_digits = today_value.strftime("%Y%m%d")
+
+        def clamp_if_future(normalized_digits, normalized_text):
+            if len(normalized_text) != 10:
+                return normalized_digits, normalized_text
+
+            try:
+                parsed = datetime.strptime(
+                    normalized_text,
+                    "%Y-%m-%d",
+                ).date()
+            except ValueError:
+                return normalized_digits, normalized_text
+
+            if parsed > today_value:
+                return today_digits, today_iso
+
+            return normalized_digits, normalized_text
+
         digits = ''.join(ch for ch in str(raw_value or "") if ch.isdigit())[:8]
         if not digits:
             return "", ""
@@ -971,7 +1157,10 @@ def show_search_files_screen(app):
             if 4 <= day_first <= 9:
                 day_digits = f"0{day_first}"
                 normalized_digits = year_digits + month_digits_for_state + day_digits
-                return normalized_digits, f"{year_digits}-{month_display}-{day_digits}"
+                return clamp_if_future(
+                    normalized_digits,
+                    f"{year_digits}-{month_display}-{day_digits}",
+                )
             normalized_digits = year_digits + month_digits_for_state + day_digits_raw
             return normalized_digits, f"{year_digits}-{month_display}-{day_digits_raw}"
 
@@ -982,7 +1171,10 @@ def show_search_files_screen(app):
         day_digits = f"{day_int:02d}"
 
         normalized_digits = year_digits + month_digits_for_state + day_digits
-        return normalized_digits, f"{year_digits}-{month_display}-{day_digits}"
+        return clamp_if_future(
+            normalized_digits,
+            f"{year_digits}-{month_display}-{day_digits}",
+        )
 
     def _create_icon_action(parent, icon_photo, fallback_text, command, *, icon_pad=None):
         local_icon_pad = icon_padding if icon_pad is None else icon_pad
@@ -1511,9 +1703,10 @@ def show_search_files_screen(app):
 
     def _resolve_calendar_start_date(value):
         text = str(value or "").strip()
+        today_value = date.today()
 
         if not text or text == "-":
-            return date.today()
+            return today_value
 
         for date_format in (
             "%Y-%m-%d",
@@ -1526,12 +1719,16 @@ def show_search_files_screen(app):
                     date_format,
                 )
 
-                return parsed.date()
+                resolved = parsed.date()
+                if resolved > today_value:
+                    return today_value
+
+                return resolved
 
             except ValueError:
                 continue
 
-        return date.today()
+        return today_value
 
     def _shift_calendar_month(
         year_value,
@@ -1833,8 +2030,19 @@ def show_search_files_screen(app):
                     f"{day_value:02d}"
                 )
 
+                cell_date = date(
+                    year_value,
+                    month_value,
+                    day_value,
+                )
+
+                is_future = (
+                    cell_date > today_value
+                )
+
                 is_selected = (
                     selected_text == iso_value
+                    and not is_future
                 )
 
                 is_today = (
@@ -1855,12 +2063,16 @@ def show_search_files_screen(app):
                         colors.TEXT_INVERSE
                         if is_selected
                         else (
+                            SF_TEXT_PLACEHOLDER
+                            if is_future
+                            else (
                             SF_PRIMARY
                             if is_today
                             else (
                                 SF_STATUS_FAILED
                                 if column_index == 6
                                 else SF_TEXT_DARK
+                            )
                             )
                         )
                     ),
@@ -1870,7 +2082,11 @@ def show_search_files_screen(app):
                         if is_selected or is_today
                         else "normal",
                     ),
-                    cursor="hand2",
+                    cursor=(
+                        "arrow"
+                        if is_future
+                        else "hand2"
+                    ),
                     anchor="center",
                     padx=4,
                     pady=6,
@@ -1888,8 +2104,9 @@ def show_search_files_screen(app):
                     _event,
                     widget=day_label,
                     selected=is_selected,
+                    future=is_future,
                 ):
-                    if not selected:
+                    if not selected and not future:
                         widget.configure(
                             bg=SF_SURFACE_HOVER_SOFT
                         )
@@ -1915,11 +2132,13 @@ def show_search_files_screen(app):
                     "<Leave>",
                     _on_day_leave,
                 )
-                day_label.bind(
-                    "<Button-1>",
-                    lambda _event, day=day_value:
-                        _select_calendar_date(day),
-                )
+
+                if not is_future:
+                    day_label.bind(
+                        "<Button-1>",
+                        lambda _event, day=day_value:
+                            _select_calendar_date(day),
+                    )
 
         def _change_calendar_month(direction):
             current_year = int(
@@ -2573,10 +2792,185 @@ def show_search_files_screen(app):
         if not text:
             return "-"
 
-        if len(text) >= 16:
-            return text[:16]
+        normalized = text.replace("T", " ")
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1]
+
+        try:
+            parsed = datetime.fromisoformat(normalized)
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+        if len(text) >= 10:
+            return text[:10]
 
         return text
+
+    def _normalize_file_type(value):
+        text = str(value or "").strip()
+
+        if not text:
+            return ""
+
+        if text.startswith("."):
+            text = text[1:]
+
+        return text.lower()
+
+    def _format_file_type_label(value):
+        normalized = _normalize_file_type(value)
+
+        if not normalized:
+            return "-"
+
+        return normalized.upper()
+
+    def _resolve_file_type_colors(value):
+        normalized = _normalize_file_type(value)
+        return colors.FILE_TYPE_COLORS.get(
+            normalized,
+            colors.DEFAULT_FILE_TYPE_COLOR,
+        )
+
+    def _format_document_type_label(value):
+        text = str(value or "").strip()
+        return text if text else "-"
+
+    def _resolve_document_type_colors(value):
+        label = _format_document_type_label(value)
+        return colors.DOCUMENT_TYPE_COLORS.get(
+            label,
+            colors.DEFAULT_DOCUMENT_TYPE_COLOR,
+        )
+
+    def _draw_document_type_badge(
+        canvas,
+        *,
+        center_x,
+        center_y,
+        document_type_value,
+        max_width,
+        tag=None,
+    ):
+        badge_font = app._font(9, "bold")
+        label = _format_document_type_label(document_type_value)
+        label = _truncate_canvas_text(
+            canvas,
+            label,
+            max(20, int(max_width) - 16),
+            badge_font,
+            truncate_suffix="...",
+        )
+
+        text_color, bg_color = _resolve_document_type_colors(document_type_value)
+        text_width = tkfont.Font(font=badge_font).measure(label)
+
+        badge_height = 24
+        badge_width = max(36, text_width + 16)
+        badge_width = min(badge_width, max(20, int(max_width)))
+
+        x1 = center_x - (badge_width / 2.0)
+        y1 = center_y - (badge_height / 2.0)
+        x2 = center_x + (badge_width / 2.0)
+        y2 = center_y + (badge_height / 2.0)
+
+        _draw_plain_rounded_rect(
+            canvas,
+            x1,
+            y1,
+            x2,
+            y2,
+            10,
+            fill=bg_color,
+            outline=bg_color,
+            border_width=1,
+        )
+
+        text_id = canvas.create_text(
+            center_x,
+            center_y,
+            text=label,
+            fill=text_color,
+            font=badge_font,
+            anchor="center",
+            tags=((tag,) if tag else ()),
+        )
+
+        if tag:
+            bbox = canvas.bbox(text_id)
+            if bbox is not None:
+                pad_x = 8
+                pad_y = 6
+                canvas.create_rectangle(
+                    bbox[0] - pad_x,
+                    bbox[1] - pad_y,
+                    bbox[2] + pad_x,
+                    bbox[3] + pad_y,
+                    fill="",
+                    outline="",
+                    tags=(tag,),
+                )
+
+    def _draw_file_type_badge(
+        canvas,
+        *,
+        center_x,
+        center_y,
+        file_type_value,
+        max_width,
+        tag=None,
+    ):
+        label = _format_file_type_label(file_type_value)
+        text_color, bg_color = _resolve_file_type_colors(file_type_value)
+        badge_font = app._font(9, "bold")
+        text_width = tkfont.Font(font=badge_font).measure(label)
+
+        badge_height = 24
+        badge_width = max(36, text_width + 16)
+        badge_width = min(badge_width, max(20, int(max_width)))
+
+        x1 = center_x - (badge_width / 2.0)
+        y1 = center_y - (badge_height / 2.0)
+        x2 = center_x + (badge_width / 2.0)
+        y2 = center_y + (badge_height / 2.0)
+
+        _draw_plain_rounded_rect(
+            canvas,
+            x1,
+            y1,
+            x2,
+            y2,
+            10,
+            fill=bg_color,
+            outline=bg_color,
+            border_width=1,
+        )
+
+        text_id = canvas.create_text(
+            center_x,
+            center_y,
+            text=label,
+            fill=text_color,
+            font=badge_font,
+            anchor="center",
+            tags=((tag,) if tag else ()),
+        )
+
+        if tag:
+            bbox = canvas.bbox(text_id)
+            if bbox is not None:
+                pad_x = 8
+                pad_y = 6
+                canvas.create_rectangle(
+                    bbox[0] - pad_x,
+                    bbox[1] - pad_y,
+                    bbox[2] + pad_x,
+                    bbox[3] + pad_y,
+                    fill="",
+                    outline="",
+                    tags=(tag,),
+                )
 
     def _format_detail_value(value, fallback="-"):
         if value is None:
@@ -2598,6 +2992,7 @@ def show_search_files_screen(app):
         text,
         max_width,
         font,
+        truncate_suffix="…",
     ):
         value = str(text or "")
 
@@ -2618,7 +3013,7 @@ def show_search_files_screen(app):
         if bbox is None or bbox[2] - bbox[0] <= max_width:
             return value
 
-        suffix = "…"
+        suffix = str(truncate_suffix or "…")
         low = 0
         high = len(value)
 
@@ -2650,6 +3045,9 @@ def show_search_files_screen(app):
         return value[:low] + suffix
 
     def _toggle_result_sort(sort_key):
+        if not search_state["has_searched"]:
+            return
+
         allowed_sort_keys = {
             "original_filename",
             "document_type",
@@ -2870,6 +3268,116 @@ def show_search_files_screen(app):
 
         return None
 
+    def _refresh_search_results_after_open_failure():
+        if not search_state["has_searched"]:
+            _draw_results_table()
+            _draw_file_details()
+            return
+
+        current_page = int(
+            result_table_state["page_index"]
+        )
+
+        loaded = _request_search_page(
+            current_page,
+            clear_detail=True,
+            redraw=False,
+        )
+
+        if loaded:
+            clamped_page = int(
+                result_table_state["page_index"]
+            )
+
+            if clamped_page != current_page:
+                _request_search_page(
+                    clamped_page,
+                    clear_detail=True,
+                    redraw=False,
+                )
+
+            if (
+                int(search_state["total_count"] or 0) > 0
+                and not search_state["results"]
+                and int(result_table_state["page_index"]) > 0
+            ):
+                _request_search_page(
+                    int(result_table_state["page_index"]) - 1,
+                    clear_detail=True,
+                    redraw=False,
+                )
+
+        _draw_results_table()
+        _draw_file_details()
+
+    def _open_selected_file():
+        selected_result = _get_selected_result()
+
+        if selected_result is None:
+            return
+
+        try:
+            current_workspace_id = int(workspace_id)
+            selected_file_id = int(
+                selected_result["file_id"]
+            )
+
+            file_operations.open_file(
+                current_workspace_id,
+                selected_file_id,
+            )
+
+        except FileNotFoundError as exc:
+            messagebox.showerror(
+                "파일 열기",
+                "파일을 NAS에서 찾을 수 없습니다. 파일 상태가 갱신되었습니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+            _refresh_search_results_after_open_failure()
+
+        except ConnectionError as exc:
+            messagebox.showerror(
+                "파일 열기",
+                "워크스페이스/NAS에 연결할 수 없습니다. 연결 상태를 확인해 주세요.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except LookupError as exc:
+            messagebox.showerror(
+                "파일 열기",
+                "선택한 파일 정보를 찾을 수 없거나 더 이상 활성 상태가 아닙니다.\n"
+                "검색 결과를 새로고침합니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+            _refresh_search_results_after_open_failure()
+
+        except NotImplementedError as exc:
+            messagebox.showerror(
+                "파일 열기",
+                "현재 환경에서는 파일 열기를 지원하지 않습니다.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except OSError as exc:
+            messagebox.showerror(
+                "파일 열기",
+                "파일을 여는 데 실패했습니다. 기본 연결 프로그램 설정을 확인해 주세요.\n\n"
+                f"{exc}",
+                parent=app.root,
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "파일 열기",
+                "파일 열기 중 오류가 발생했습니다.\n\n"
+                f"{type(exc).__name__}: {exc}",
+                parent=app.root,
+            )
+
     def _get_selected_result_index():
         selected_file_id = search_state[
             "selected_file_id"
@@ -2898,6 +3406,11 @@ def show_search_files_screen(app):
 
         _draw_results_table()
         _draw_file_details()
+
+    def _open_result_row(file_id):
+        _select_result_row(file_id)
+        _open_selected_file()
+        return "break"
 
     def _select_result_by_index(result_index):
         results = search_state["results"]
@@ -3452,16 +3965,6 @@ def show_search_files_screen(app):
             )
             title_tail_x = badge_right
 
-        if selected_count:
-            card_canvas.create_text(
-                title_tail_x + 10,
-                title_center_y,
-                text=f"· {selected_count}개 선택",
-                fill=SF_TEXT_MAIN,
-                font=app._font(12, "bold"),
-                anchor="w",
-            )
-
         if search_state["is_loading_page"]:
             card_canvas.create_text(
                 inner_x2 - 12,
@@ -3551,14 +4054,13 @@ def show_search_files_screen(app):
 
         table_col_widths_pct = [
             5.0,
-            25.0,
+            35.0,
             10.0,
-            15.0,
-            10.0,
-            15.0,
+            14.0,
+            7.0,
+            14.0,
             5.0,
             10.0,
-            5.0,
         ]
         header_definitions = [
             {
@@ -3592,10 +4094,6 @@ def show_search_files_screen(app):
             {
                 "text": "파일 종류",
                 "sort_key": "file_ext",
-            },
-            {
-                "text": "",
-                "sort_key": None,
             },
         ]
 
@@ -3658,12 +4156,7 @@ def show_search_files_screen(app):
                     if result_sort_state["key"] == sort_key
                     else SF_TEXT_DARK
                 ),
-                font=app._font(
-                    10,
-                    "bold"
-                    if result_sort_state["key"] == sort_key
-                    else "normal",
-                ),
+                font=app._font(11),
                 anchor="center",
                 tags=(header_tag,),
             )
@@ -3854,7 +4347,7 @@ def show_search_files_screen(app):
                 (body_top + body_bottom) / 2.0,
                 text=(
                     "검색어나 상세 조건을 입력한 뒤\n"
-                    "Enter 키를 눌러 주세요."
+                    "Enter 키를 눌러 주세요"
                 ),
                 fill=SF_TEXT_PLACEHOLDER,
                 font=app._font(11),
@@ -3877,8 +4370,8 @@ def show_search_files_screen(app):
             )
 
         else:
-            row_font = app._font(9)
-            filename_font = app._font(9, "bold")
+            row_font = app._font(10)
+            filename_font = app._font(10, "bold")
 
             for local_index, result in enumerate(page_results):
                 row_top, row_bottom = row_slots[
@@ -3903,10 +4396,10 @@ def show_search_files_screen(app):
 
                 if is_selected_row:
                     row_fill = (
-                        colors.SURFACE_ACCENT_SOFT
+                        SF_RESULT_ROW_SELECTED_BG
                     )
                 elif is_hovered:
-                    row_fill = SF_SURFACE_HOVER_SOFT
+                    row_fill = SF_RESULT_ROW_HOVER_BG
                 else:
                     row_fill = colors.SURFACE_ALT
 
@@ -3966,23 +4459,25 @@ def show_search_files_screen(app):
 
                 filename = _truncate_canvas_text(
                     card_canvas,
-                    result.get("original_filename", ""),
+                    str(
+                        result.get(
+                            "original_filename",
+                            "",
+                        )
+                        or ""
+                    ).lower(),
                     column_widths[1] - 14,
                     filename_font,
                 )
 
-                document_type = _truncate_canvas_text(
-                    card_canvas,
-                    result.get("document_type", ""),
-                    column_widths[2] - 10,
-                    row_font,
-                )
+                document_type = result.get("document_type", "")
 
                 uploaded_by = _truncate_canvas_text(
                     card_canvas,
                     result.get("uploaded_by", ""),
                     column_widths[4] - 10,
                     row_font,
+                    truncate_suffix="...",
                 )
 
                 row_values = [
@@ -3997,12 +4492,33 @@ def show_search_files_screen(app):
                     _format_file_size(
                         result.get("file_size")
                     ),
-                    result.get("file_ext") or "-",
-                    "",
+                    result.get("file_ext"),
                 ]
 
                 for column_index, value in enumerate(row_values):
                     if column_index == 0 or value is None:
+                        continue
+
+                    if column_index == 2:
+                        _draw_document_type_badge(
+                            card_canvas,
+                            center_x=column_centers[column_index],
+                            center_y=row_center,
+                            document_type_value=value,
+                            max_width=column_widths[column_index] - 10,
+                            tag=row_tag,
+                        )
+                        continue
+
+                    if column_index == 7:
+                        _draw_file_type_badge(
+                            card_canvas,
+                            center_x=column_centers[column_index],
+                            center_y=row_center,
+                            file_type_value=value,
+                            max_width=column_widths[column_index] - 10,
+                            tag=row_tag,
+                        )
                         continue
 
                     anchor = (
@@ -4036,6 +4552,12 @@ def show_search_files_screen(app):
                     lambda _event, fid=file_id:
                         _select_result_row(fid),
                 )
+                card_canvas.tag_bind(
+                    row_tag,
+                    "<Double-Button-1>",
+                    lambda _event, fid=file_id:
+                        _open_result_row(fid),
+                )
                 def _on_row_enter(
                     _event,
                     hovered_id=file_id,
@@ -4053,7 +4575,7 @@ def show_search_files_screen(app):
                     ):
                         card_canvas.itemconfigure(
                             background_tag,
-                            fill=SF_SURFACE_HOVER_SOFT,
+                            fill=SF_RESULT_ROW_HOVER_BG,
                         )
 
                 def _on_row_leave(
@@ -4112,77 +4634,42 @@ def show_search_files_screen(app):
                 width=1,
             )
 
-        if results and not search_state["error"]:
+        if not search_state["error"]:
             page_count = _get_page_count()
             current_page = int(
                 result_table_state["page_index"]
             )
 
             footer_center_y = (
-                body_bottom + inner_y2
-            ) / 2.0
-
-            visible_page_indexes = (
-                _get_visible_page_indexes()
-            )
-
-            show_navigation_icons = (
-                page_count
-                > SF_VISIBLE_PAGE_BUTTONS
+                body_bottom
+                + ((inner_y2 - body_bottom) / 2.0)
+                + 2
             )
 
             page_button_width = 30
             page_button_height = 28
-            icon_button_width = 30
-            button_gap = 6
+            label_text = f"{current_page + 1} / {page_count}"
+            label_font = app._font(12)
+            label_width = tkfont.Font(font=label_font).measure(label_text)
 
-            control_specs = []
+            # Mirror workspace_sync pagination spacing:
+            # far_before, before, page label, after, far_after
+            # with gaps of 6, 8, 8, and 6.
+            first_gap = 6
+            second_gap = 8
+            third_gap = 8
+            fourth_gap = 6
 
-            if show_navigation_icons:
-                control_specs.extend(
-                    [
-                        {
-                            "kind": "far_before",
-                            "width": icon_button_width,
-                        },
-                        {
-                            "kind": "before",
-                            "width": icon_button_width,
-                        },
-                    ]
-                )
-
-            for visible_page_index in visible_page_indexes:
-                control_specs.append(
-                    {
-                        "kind": "page",
-                        "page_index": visible_page_index,
-                        "width": page_button_width,
-                    }
-                )
-
-            if show_navigation_icons:
-                control_specs.extend(
-                    [
-                        {
-                            "kind": "after",
-                            "width": icon_button_width,
-                        },
-                        {
-                            "kind": "far_after",
-                            "width": icon_button_width,
-                        },
-                    ]
-                )
-
-            total_controls_width = sum(
-                spec["width"]
-                for spec in control_specs
-            )
-
-            total_controls_width += (
-                button_gap
-                * max(0, len(control_specs) - 1)
+            total_controls_width = (
+                page_button_width
+                + first_gap
+                + page_button_width
+                + second_gap
+                + label_width
+                + third_gap
+                + page_button_width
+                + fourth_gap
+                + page_button_width
             )
 
             controls_x = (
@@ -4190,129 +4677,80 @@ def show_search_files_screen(app):
                 - (total_controls_width / 2.0)
             )
 
-            for control_index, spec in enumerate(
-                control_specs
-            ):
-                control_width = spec["width"]
-                control_center_x = (
-                    controls_x + (control_width / 2.0)
-                )
+            can_go_prev = (
+                current_page > 0
+                and not page_loading
+            )
+            can_go_next = (
+                current_page < page_count - 1
+                and not page_loading
+            )
 
-                kind = spec["kind"]
-                control_tag = (
-                    f"sf_page_control_{control_index}"
-                )
+            first_center_x = controls_x + (page_button_width / 2.0)
+            _draw_pagination_button(
+                card_canvas,
+                center_x=first_center_x,
+                center_y=footer_center_y,
+                width=page_button_width,
+                height=page_button_height,
+                tag="sf_page_control_first",
+                icon=far_before_icon_photo,
+                enabled=can_go_prev,
+                command=_go_to_first_result_page,
+            )
+            controls_x += page_button_width + first_gap
 
-                if kind == "far_before":
-                    enabled = (
-                        current_page > 0
-                        and not page_loading
-                    )
+            prev_center_x = controls_x + (page_button_width / 2.0)
+            _draw_pagination_button(
+                card_canvas,
+                center_x=prev_center_x,
+                center_y=footer_center_y,
+                width=page_button_width,
+                height=page_button_height,
+                tag="sf_page_control_prev",
+                icon=before_icon_photo,
+                enabled=can_go_prev,
+                command=lambda: _change_result_page(-1),
+            )
+            controls_x += page_button_width + second_gap
 
-                    _draw_pagination_button(
-                        card_canvas,
-                        center_x=control_center_x,
-                        center_y=footer_center_y,
-                        width=control_width,
-                        height=page_button_height,
-                        tag=control_tag,
-                        icon=far_before_icon_photo,
-                        text="|<",
-                        enabled=enabled,
-                        command=_go_to_first_result_page,
-                    )
+            label_center_x = controls_x + (label_width / 2.0)
+            card_canvas.create_text(
+                label_center_x,
+                footer_center_y,
+                text=label_text,
+                fill=SF_TEXT_MAIN,
+                font=label_font,
+                anchor="center",
+            )
+            controls_x += label_width + third_gap
 
-                elif kind == "before":
-                    enabled = (
-                        current_page > 0
-                        and not page_loading
-                    )
+            next_center_x = controls_x + (page_button_width / 2.0)
+            _draw_pagination_button(
+                card_canvas,
+                center_x=next_center_x,
+                center_y=footer_center_y,
+                width=page_button_width,
+                height=page_button_height,
+                tag="sf_page_control_next",
+                icon=after_icon_photo,
+                enabled=can_go_next,
+                command=lambda: _change_result_page(1),
+            )
+            controls_x += page_button_width + fourth_gap
 
-                    _draw_pagination_button(
-                        card_canvas,
-                        center_x=control_center_x,
-                        center_y=footer_center_y,
-                        width=control_width,
-                        height=page_button_height,
-                        tag=control_tag,
-                        icon=before_icon_photo,
-                        text="<",
-                        enabled=enabled,
-                        command=lambda:
-                            _change_result_page(-1),
-                    )
-
-                elif kind == "page":
-                    visible_page_index = spec[
-                        "page_index"
-                    ]
-
-                    _draw_pagination_button(
-                        card_canvas,
-                        center_x=control_center_x,
-                        center_y=footer_center_y,
-                        width=control_width,
-                        height=page_button_height,
-                        tag=control_tag,
-                        text=str(
-                            visible_page_index + 1
-                        ),
-                        active=(
-                            visible_page_index
-                            == current_page
-                        ),
-                        enabled=not page_loading,
-                        command=(
-                            lambda target_page=
-                                visible_page_index:
-                                _go_to_result_page(
-                                    target_page
-                                )
-                        ),
-                    )
-
-                elif kind == "after":
-                    enabled = (
-                        current_page < page_count - 1
-                        and not page_loading
-                    )
-
-                    _draw_pagination_button(
-                        card_canvas,
-                        center_x=control_center_x,
-                        center_y=footer_center_y,
-                        width=control_width,
-                        height=page_button_height,
-                        tag=control_tag,
-                        icon=after_icon_photo,
-                        text=">",
-                        enabled=enabled,
-                        command=lambda:
-                            _change_result_page(1),
-                    )
-
-                elif kind == "far_after":
-                    enabled = (
-                        current_page < page_count - 1
-                        and not page_loading
-                    )
-
-                    _draw_pagination_button(
-                        card_canvas,
-                        center_x=control_center_x,
-                        center_y=footer_center_y,
-                        width=control_width,
-                        height=page_button_height,
-                        tag=control_tag,
-                        icon=far_after_icon_photo,
-                        text=">|",
-                        enabled=enabled,
-                        command=_go_to_last_result_page,
-                    )
-
-                controls_x += (
-                    control_width + button_gap
-                )
+            last_center_x = controls_x + (page_button_width / 2.0)
+            _draw_pagination_button(
+                card_canvas,
+                center_x=last_center_x,
+                center_y=footer_center_y,
+                width=page_button_width,
+                height=page_button_height,
+                tag="sf_page_control_last",
+                icon=far_after_icon_photo,
+                enabled=can_go_next,
+                command=_go_to_last_result_page,
+            )
 
         card_canvas.result_table_icons_ref = {
             **result_table_icons,
@@ -4408,25 +4846,25 @@ def show_search_files_screen(app):
 
         if selected_result is None:
             canvas.create_text(
-                (card_x1 + card_x2) / 2.0,
-                card_y1 + 90,
+                inner_x,
+                card_y1 + 22,
                 text="파일 상세 정보",
                 fill=SF_TEXT_MAIN,
                 font=app._font(14, "bold"),
-                anchor="center",
+                anchor="nw",
             )
 
             canvas.create_text(
-                (card_x1 + card_x2) / 2.0,
-                card_y1 + 140,
+                inner_x,
+                card_y1 + 58,
                 text=(
-                    "검색 결과에서 파일을 선택하면\n"
-                    "상세 정보가 여기에 표시돼요."
+                    "검색 결과에서 파일을 \n선택하면 상세 정보가 \n여기에 표시돼요"
                 ),
                 fill=SF_TEXT_PLACEHOLDER,
-                font=app._font(10),
-                justify="center",
-                anchor="center",
+                font=app._font(11),
+                justify="left",
+                anchor="nw",
+                width=max(80, inner_width),
             )
             return
 
@@ -4525,8 +4963,8 @@ def show_search_files_screen(app):
             y=y_cursor,
             width=inner_width,
             label="파일 종류",
-            value=selected_result.get(
-                "file_ext"
+            value=_format_file_type_label(
+                selected_result.get("file_ext")
             ),
         )
 
@@ -4550,7 +4988,7 @@ def show_search_files_screen(app):
             value=selected_result.get("tags"),
         )
 
-        _draw_detail_field(
+        y_cursor = _draw_detail_field(
             canvas,
             x=inner_x,
             y=y_cursor,
@@ -4559,6 +4997,89 @@ def show_search_files_screen(app):
             value=selected_result.get(
                 "relative_path"
             ),
+        )
+
+        button_height = 42
+        button_x1 = inner_x
+        button_x2 = card_x2 - 20
+
+        button_y1 = max(
+            y_cursor + 10,
+            card_y2 - 20 - button_height,
+        )
+        button_y2 = button_y1 + button_height
+
+        if button_y2 > card_y2 - 8:
+            button_y2 = card_y2 - 8
+            button_y1 = button_y2 - button_height
+
+        button_tag = "sf_detail_open_button"
+        button_fill = SF_PRIMARY
+        button_hover_fill = colors.PRIMARY_HOVER
+
+        button_shape = app._smooth_rounded_rect(
+            canvas,
+            button_x1,
+            button_y1,
+            button_x2,
+            button_y2,
+            10,
+            fill=button_fill,
+            outline=button_fill,
+            width=1,
+            tags=(button_tag,),
+        )
+
+        canvas.create_text(
+            (button_x1 + button_x2) / 2.0,
+            (button_y1 + button_y2) / 2.0,
+            text="파일 열기",
+            fill=colors.TEXT_INVERSE,
+            font=app._font(11, "bold"),
+            anchor="center",
+            tags=(button_tag,),
+        )
+
+        canvas.create_rectangle(
+            button_x1,
+            button_y1,
+            button_x2,
+            button_y2,
+            fill="",
+            outline="",
+            tags=(button_tag,),
+        )
+
+        def _on_open_button_enter(_event=None):
+            canvas.itemconfigure(
+                button_shape,
+                fill=button_hover_fill,
+                outline=button_hover_fill,
+            )
+            canvas.configure(cursor="hand2")
+
+        def _on_open_button_leave(_event=None):
+            canvas.itemconfigure(
+                button_shape,
+                fill=button_fill,
+                outline=button_fill,
+            )
+            canvas.configure(cursor="")
+
+        canvas.tag_bind(
+            button_tag,
+            "<Enter>",
+            _on_open_button_enter,
+        )
+        canvas.tag_bind(
+            button_tag,
+            "<Leave>",
+            _on_open_button_leave,
+        )
+        canvas.tag_bind(
+            button_tag,
+            "<Button-1>",
+            lambda _event: _open_selected_file(),
         )
 
     def _draw_search_box():

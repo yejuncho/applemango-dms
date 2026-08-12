@@ -1,8 +1,9 @@
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
+from calendar import monthrange
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 import re
 import time
 import math
@@ -33,7 +34,7 @@ except ImportError:
 
 SF_SURFACE = colors.SURFACE_ALT
 SF_SURFACE_ALT = colors.SURFACE_ACCENT_SOFT
-SF_ACCENT = colors.ACCENT
+SF_ACCENT = colors.SURFACE_ACCENT_SOFT
 SF_SURFACE_HOVER = colors.SURFACE_HOVER
 SF_SURFACE_HOVER_SOFT = colors.SURFACE_HOVER_SOFT
 SF_SURFACE_DANGER_HOVER = colors.SURFACE_DANGER_HOVER
@@ -56,6 +57,7 @@ SF_PRIMARY_GLOW = colors.SECONDARY_GLOW
 SF_PRIMARY_GLOW_STRONG = colors.SECONDARY_GLOW_STRONG
 SF_PRIMARY_ACTION_HOVER = colors.PRIMARY_ACTION_HOVER
 SF_ROW_SELECTED_SEPARATOR = colors.ROW_SELECTED_SEPARATOR
+SF_ROW_HIGHLIGHT_BG = colors.SURFACE_ALT2
 
 SF_STATUS_PROCESSING = colors.PROCESSING
 SF_STATUS_FAILED = colors.FAILED_STRONG
@@ -65,6 +67,15 @@ SF_NUMBER_DESIGNATION_BG = getattr(
     colors,
     "NUMBER_DESIGNATION_BG",
     colors.SURFACE_HOVER,
+)
+SF_CALENDAR_WEEKDAYS = (
+    "월",
+    "화",
+    "수",
+    "목",
+    "금",
+    "토",
+    "일",
 )
 
 
@@ -168,6 +179,7 @@ def show_save_files_screen(app):
 
     selected_files = []
     selected_row_keys = set()
+    highlighted_row_key = None
     row_metadata_state = {}
     pending_count_var = tk.StringVar(value="0")
     pending_title_text = "업로드 대기 파일"
@@ -723,6 +735,7 @@ def show_save_files_screen(app):
         height,
         fill,
         outline,
+        hover_fill=None,
         text_color,
         icon_photo=None,
         icon_fallback_text=None,
@@ -748,7 +761,8 @@ def show_save_files_screen(app):
             if mode == "hover" and base_fill == SF_SURFACE:
                 fill_color = SF_SURFACE_HOVER
             elif mode == "hover" and base_fill != SF_SURFACE:
-                fill_color = SF_PRIMARY_ACTION_HOVER
+                fill_color = hover_fill if hover_fill is not None else SF_PRIMARY_ACTION_HOVER
+                outline_color = fill_color
             else:
                 if button_canvas.override_fill is not None:
                     fill_color = button_canvas.override_fill
@@ -1144,52 +1158,15 @@ def show_save_files_screen(app):
         start_upload_placeholder,
         width=100,
         height=30,
-        fill=SF_PRIMARY,
-        outline=SF_PRIMARY,
+        fill=colors.PRIMARY,
+        outline=colors.PRIMARY,
+        hover_fill=colors.PRIMARY_HOVER,
         text_color=SF_TEXT_INVERSE,
         icon_photo=upload_icon,
         icon_fallback_text="⬆",
         icon_offset_x=-4,
         text_offset_x=-3,
     )
-
-    upload_glow_state = {
-        "job": None,
-        "phase": 0,
-    }
-
-    def stop_upload_button_glow():
-        job = upload_glow_state.get("job")
-        if job is not None:
-            try:
-                app.root.after_cancel(job)
-            except Exception:
-                pass
-            upload_glow_state["job"] = None
-        upload_btn.set_button_overrides(fill_override=None, outline_override=None)
-
-    def animate_upload_button_glow():
-        upload_glow_state["job"] = None
-        has_selected_files = bool(selected_files) and any(path in selected_row_keys for path in selected_files)
-        if not has_selected_files:
-            stop_upload_button_glow()
-            return
-
-        glow_frames = [
-            (SF_PRIMARY, SF_PRIMARY),
-            (SF_PRIMARY_HOVER, SF_PRIMARY_GLOW),
-            (SF_PRIMARY_ACTIVE, SF_PRIMARY_GLOW_STRONG),
-            (SF_PRIMARY_HOVER, SF_PRIMARY_GLOW),
-        ]
-        frame_index = upload_glow_state["phase"]
-        glow_fill, glow_outline = glow_frames[frame_index]
-        upload_btn.set_button_overrides(fill_override=glow_fill, outline_override=glow_outline)
-        upload_glow_state["phase"] = (frame_index + 1) % len(glow_frames)
-        upload_glow_state["job"] = app.root.after(260, animate_upload_button_glow)
-
-    def ensure_upload_button_glow_running():
-        if upload_glow_state.get("job") is None:
-            animate_upload_button_glow()
 
     def update_action_buttons_visibility():
         has_files = bool(selected_files)
@@ -1199,7 +1176,6 @@ def show_save_files_screen(app):
         remove_btn.pack_forget()
         clear_btn.pack_forget()
         upload_btn.grid_remove()
-        stop_upload_button_glow()
 
         if not has_files:
             return
@@ -1209,14 +1185,13 @@ def show_save_files_screen(app):
         if has_selected_files:
             remove_btn.pack(side="left", padx=(row1_icon_gap, 0))
             upload_btn.grid(row=0, column=4, sticky="e")
-            ensure_upload_button_glow_running()
 
     update_action_buttons_visibility()
 
     # Row-2 / Row-3 shared column widths (percent).
     # Added an icon-only column between checkbox and filename;
     # width is taken only from the document-type column.
-    table_col_widths_pct = [2.5, 2.5, 32, 14.5, 10, 13.5, 7.5, 7.5, 10.0]
+    table_col_widths_pct = [2.5, 2.5, 29.5, 17.0, 10, 13.5, 7.5, 7.5, 10.0]
     row2_headers = [
         "",
         "",
@@ -1410,7 +1385,7 @@ def show_save_files_screen(app):
 
     table_row_height = int(round(34 * 1.15))
     font_measure_cache = {}
-    current_year = time.localtime().tm_year
+    current_year = 9999
     row_combo_style_name = "SaveFilesRow.TCombobox"
     combo_style = ttk.Style(app.root)
     combo_style.configure(
@@ -1505,6 +1480,27 @@ def show_save_files_screen(app):
         return month_one, carry_to_day
 
     def normalize_date_input(raw_value):
+        today_value = date.today()
+        today_iso = today_value.isoformat()
+        today_digits = today_value.strftime("%Y%m%d")
+
+        def clamp_if_future(normalized_digits, normalized_text):
+            if len(normalized_text) != 10:
+                return normalized_digits, normalized_text
+
+            try:
+                parsed = datetime.strptime(
+                    normalized_text,
+                    "%Y-%m-%d",
+                ).date()
+            except ValueError:
+                return normalized_digits, normalized_text
+
+            if parsed > today_value:
+                return today_digits, today_iso
+
+            return normalized_digits, normalized_text
+
         digits = ''.join(ch for ch in str(raw_value or "") if ch.isdigit())[:8]
         if not digits:
             return "", ""
@@ -1561,7 +1557,10 @@ def show_save_files_screen(app):
             if 4 <= day_first <= 9:
                 day_digits = f"0{day_first}"
                 normalized_digits = year_digits + month_digits_for_state + day_digits
-                return normalized_digits, f"{year_digits}-{month_display}-{day_digits}"
+                return clamp_if_future(
+                    normalized_digits,
+                    f"{year_digits}-{month_display}-{day_digits}",
+                )
             normalized_digits = year_digits + month_digits_for_state + day_digits_raw
             return normalized_digits, f"{year_digits}-{month_display}-{day_digits_raw}"
 
@@ -1572,7 +1571,10 @@ def show_save_files_screen(app):
         day_digits = f"{day_int:02d}"
 
         normalized_digits = year_digits + month_digits_for_state + day_digits
-        return normalized_digits, f"{year_digits}-{month_display}-{day_digits}"
+        return clamp_if_future(
+            normalized_digits,
+            f"{year_digits}-{month_display}-{day_digits}",
+        )
 
     def pick_file_format_icon_key(path_obj):
         ext = path_obj.suffix.lower().lstrip(".")
@@ -1656,11 +1658,14 @@ def show_save_files_screen(app):
         }
 
     def get_row_data():
+        nonlocal highlighted_row_key
         selected_row_keys.intersection_update(selected_files)
         active_keys = set(selected_files)
         for stale_key in list(row_metadata_state.keys()):
             if stale_key not in active_keys:
                 row_metadata_state.pop(stale_key, None)
+        if highlighted_row_key not in active_keys:
+            highlighted_row_key = None
         if not selected_files:
             return []
         return [metadata_row_from_path(file_path) for file_path in selected_files]
@@ -1835,7 +1840,10 @@ def show_save_files_screen(app):
     )
 
     app._save_files_row_date_entries = []
+    app._save_files_row_doc_entries = []
     app._save_files_row_tag_entries = []
+    app._save_files_row_input_widgets = []
+    app._save_files_row_canvases = []
 
     def set_row_doc_expand_icon(icon_label, row_selected, expanded):
         if icon_label is None or not icon_label.winfo_exists():
@@ -1856,6 +1864,43 @@ def show_save_files_screen(app):
                 text=fallback_text,
                 fg=SF_TEXT_INVERSE if row_selected else SF_TEXT_MAIN,
             )
+
+    def create_row_field_icon_action(parent, icon_photo, fallback_text, command, *, base_bg):
+        wrapper = tk.Frame(parent, bg=base_bg, highlightthickness=0, bd=0, cursor="hand2")
+        label = tk.Label(
+            wrapper,
+            image=icon_photo,
+            text=fallback_text if icon_photo is None else "",
+            compound="center",
+            bg=base_bg,
+            fg=SF_TEXT_MAIN,
+            font=("Segoe UI Emoji", 10),
+            cursor="hand2",
+        )
+        label.pack(padx=1, pady=1)
+
+        def set_state(bg_color):
+            wrapper.configure(bg=bg_color)
+            label.configure(bg=bg_color)
+
+        def on_enter(_event=None):
+            set_state(SF_SURFACE_HOVER_SOFT)
+
+        def on_leave(_event=None):
+            set_state(base_bg)
+
+        def on_click(_event=None):
+            command()
+            return "break"
+
+        for widget in (wrapper, label):
+            widget.bind("<Enter>", on_enter, add="+")
+            widget.bind("<Leave>", on_leave, add="+")
+            widget.bind("<Button-1>", on_click, add="+")
+
+        wrapper.image = icon_photo
+        wrapper.icon_label = label
+        return wrapper
 
     def get_batch_date_default_text():
         selected_keys = get_right_card_selected_keys()
@@ -1952,6 +1997,26 @@ def show_save_files_screen(app):
             current = getattr(current, "master", None)
         return False
 
+    def is_click_inside_metadata_row(clicked_widget, event):
+        row_canvases = list(getattr(app, "_save_files_row_canvases", []))
+        for row_canvas in row_canvases:
+            if row_canvas is None or not row_canvas.winfo_exists():
+                continue
+            if not is_descendant_widget(clicked_widget, row_canvas):
+                continue
+
+            try:
+                local_x = float(event.x_root) - float(row_canvas.winfo_rootx())
+                local_y = float(event.y_root) - float(row_canvas.winfo_rooty())
+                active_width = float(getattr(row_canvas, "_active_row_width", row_canvas.winfo_width()))
+                active_height = float(getattr(row_canvas, "_active_row_height", row_canvas.winfo_height()))
+            except Exception:
+                return True
+
+            return (0.0 <= local_x <= active_width) and (0.0 <= local_y <= active_height)
+
+        return False
+
     def handle_save_files_global_click(event):
         active_card = getattr(app, "_save_files_active_right_card", None)
         if active_card is None or not active_card.winfo_exists():
@@ -1962,12 +2027,25 @@ def show_save_files_screen(app):
         except Exception:
             return
         if clicked_widget is None:
+            blur_row_metadata_inputs(clicked_widget=None)
+            clear_highlighted_row_item()
             return
+
+        row_date_popup = getattr(app, "_save_files_row_date_popup", None)
+        row_date_anchor = getattr(app, "_save_files_row_date_popup_anchor", None)
+        row_date_popup_opened_at = float(getattr(app, "_save_files_row_date_popup_opened_at", 0.0) or 0.0)
+        now_seconds = time.time()
+        if row_date_popup is not None and row_date_popup.winfo_exists():
+            if is_descendant_widget(clicked_widget, row_date_popup):
+                return
+            if now_seconds - row_date_popup_opened_at < 0.15:
+                return
+            if row_date_anchor is None or not is_descendant_widget(clicked_widget, row_date_anchor):
+                close_row_date_popup()
 
         row_doc_popup = getattr(app, "_save_files_row_doc_popup", None)
         row_doc_anchor = getattr(app, "_save_files_row_doc_popup_anchor", None)
         row_doc_popup_opened_at = float(getattr(app, "_save_files_row_doc_popup_opened_at", 0.0) or 0.0)
-        now_seconds = time.time()
         if row_doc_popup is not None and row_doc_popup.winfo_exists():
             if is_descendant_widget(clicked_widget, row_doc_popup):
                 return
@@ -1976,17 +2054,12 @@ def show_save_files_screen(app):
             if row_doc_anchor is None or not is_descendant_widget(clicked_widget, row_doc_anchor):
                 close_row_doc_type_popup()
 
-        row_date_entries = list(getattr(app, "_save_files_row_date_entries", []))
-        row_tag_entries = list(getattr(app, "_save_files_row_tag_entries", []))
-        focused_widget = app.root.focus_get()
+        blur_row_metadata_inputs(clicked_widget=clicked_widget)
 
-        for row_entry in row_date_entries + row_tag_entries:
-            if row_entry is None or not row_entry.winfo_exists():
-                continue
-            if focused_widget is not None and is_descendant_widget(focused_widget, row_entry):
-                if not is_descendant_widget(clicked_widget, row_entry):
-                    active_card.focus_set()
-                break
+        click_in_row_region = is_click_inside_metadata_row(clicked_widget, event)
+
+        if not click_in_row_region:
+            clear_highlighted_row_item()
 
         date_entry = getattr(active_card, "batch_date_entry_ref", None)
         tag_entry = getattr(active_card, "batch_tag_entry_ref", None)
@@ -2442,22 +2515,62 @@ def show_save_files_screen(app):
         right_card.batch_apply_button_ref = apply_button
         right_card.right_expand_icon_ref = right_expand_icon
 
-    def is_ctrl_pressed(event):
-        return bool(getattr(event, "state", 0) & 0x0004)
-
-    def select_row_item(row_key, event=None):
-        if is_ctrl_pressed(event):
-            if row_key in selected_row_keys:
-                selected_row_keys.remove(row_key)
-            else:
-                selected_row_keys.add(row_key)
-        else:
-            selected_row_keys.clear()
-            selected_row_keys.add(row_key)
+    def highlight_row_item(row_key):
+        nonlocal highlighted_row_key
+        if highlighted_row_key == row_key:
+            return "break"
+        highlighted_row_key = row_key
         refresh_row3_rows()
         return "break"
 
+    def clear_highlighted_row_item():
+        nonlocal highlighted_row_key
+        if highlighted_row_key is None:
+            return
+        highlighted_row_key = None
+        refresh_row3_rows()
+
+    def blur_row_metadata_inputs(clicked_widget=None):
+        row_inputs = list(getattr(app, "_save_files_row_input_widgets", []))
+        focused_widget = app.root.focus_get()
+        clicked_inside_any_row_input = False
+
+        for row_input in row_inputs:
+            if row_input is None or not row_input.winfo_exists():
+                continue
+
+            if clicked_widget is not None and is_descendant_widget(clicked_widget, row_input):
+                clicked_inside_any_row_input = True
+                continue
+
+            entry_widget = getattr(row_input, "entry", None)
+            if entry_widget is not None and entry_widget.winfo_exists():
+                try:
+                    entry_widget.selection_clear()
+                except Exception:
+                    pass
+
+            if focused_widget is not None and is_descendant_widget(focused_widget, row_input):
+                row_input._focused = False
+                row_input._refresh_visual_state(redraw=True)
+                focused_widget = None
+
+        if clicked_inside_any_row_input:
+            return
+
+        try:
+            app.root.focus_set()
+        except Exception:
+            try:
+                row3_canvas.focus_set()
+            except Exception:
+                try:
+                    detail_card.focus_set()
+                except Exception:
+                    pass
+
     def toggle_row_item_checkbox(row_key, _event=None):
+        blur_row_metadata_inputs(clicked_widget=None)
         if row_key in selected_row_keys:
             selected_row_keys.remove(row_key)
         else:
@@ -2599,6 +2712,353 @@ def show_save_files_screen(app):
         if row3_scroll_state["dragging"]:
             on_row3_drag_release(event)
 
+    def resolve_calendar_start_date(value):
+        text = str(value or "").strip()
+        today_value = date.today()
+
+        if not text:
+            return today_value
+
+        for date_format in (
+            "%Y-%m-%d",
+            "%Y-%m",
+            "%Y",
+        ):
+            try:
+                parsed = datetime.strptime(
+                    text,
+                    date_format,
+                ).date()
+                if parsed > today_value:
+                    return today_value
+                return parsed
+            except ValueError:
+                continue
+
+        return today_value
+
+    def shift_calendar_month(year_value, month_value, direction):
+        minimum_month_index = 1 * 12
+        maximum_month_index = (9999 * 12) + 11
+
+        month_index = (
+            int(year_value) * 12
+            + int(month_value)
+            - 1
+            + int(direction)
+        )
+
+        month_index = max(
+            minimum_month_index,
+            min(maximum_month_index, month_index),
+        )
+
+        shifted_year = month_index // 12
+        shifted_month = (month_index % 12) + 1
+        return shifted_year, shifted_month
+
+    def close_row_date_popup():
+        popup = getattr(app, "_save_files_row_date_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+
+        app._save_files_row_date_popup = None
+        app._save_files_row_date_popup_anchor = None
+        app._save_files_row_date_popup_opened_at = 0.0
+        app._save_files_row_date_popup_display_year = None
+        app._save_files_row_date_popup_display_month = None
+
+    def open_row_date_popup(field_widget, row_key, value_var):
+        existing_popup = getattr(app, "_save_files_row_date_popup", None)
+        existing_anchor = getattr(app, "_save_files_row_date_popup_anchor", None)
+        if existing_popup is not None and existing_popup.winfo_exists() and existing_anchor is field_widget:
+            close_row_date_popup()
+            return "break"
+
+        close_row_doc_type_popup()
+        close_row_date_popup()
+
+        initial_date = resolve_calendar_start_date(value_var.get())
+        app._save_files_row_date_popup_display_year = initial_date.year
+        app._save_files_row_date_popup_display_month = initial_date.month
+
+        popup_width = 286
+        popup_height = 326
+        popup_x = field_widget.winfo_rootx()
+        popup_y = field_widget.winfo_rooty() + field_widget.winfo_height() + 2
+
+        popup = tk.Toplevel(app.root)
+        popup.overrideredirect(True)
+        popup.transient(app.root)
+        popup.configure(bg=SF_SURFACE)
+        popup.geometry(f"{popup_width}x{popup_height}+{popup_x}+{popup_y}")
+        popup.lift()
+        popup.focus_force()
+
+        shell_canvas = tk.Canvas(
+            popup,
+            bg=SF_SURFACE,
+            highlightthickness=0,
+            bd=0,
+        )
+        shell_canvas.pack(fill="both", expand=True)
+
+        app._smooth_rounded_rect(
+            shell_canvas,
+            1,
+            1,
+            popup_width - 1,
+            popup_height - 1,
+            12,
+            fill=SF_SURFACE,
+            outline=SF_BORDER_INPUT,
+            width=1,
+        )
+
+        body = tk.Frame(
+            shell_canvas,
+            bg=SF_SURFACE,
+            highlightthickness=0,
+            bd=0,
+        )
+        shell_canvas.create_window(
+            8,
+            8,
+            anchor="nw",
+            window=body,
+            width=popup_width - 16,
+            height=popup_height - 16,
+        )
+
+        header = tk.Frame(
+            body,
+            bg=SF_SURFACE,
+            highlightthickness=0,
+            bd=0,
+        )
+        header.pack(fill="x", padx=4, pady=(2, 8))
+
+        month_title = tk.Label(
+            header,
+            text="",
+            bg=SF_SURFACE,
+            fg=SF_TEXT_MAIN,
+            font=app._font(12, "bold"),
+            anchor="center",
+        )
+        month_title.pack(side="left", fill="x", expand=True)
+
+        calendar_grid = tk.Frame(
+            body,
+            bg=SF_SURFACE,
+            highlightthickness=0,
+            bd=0,
+        )
+        calendar_grid.pack(fill="both", expand=True, padx=4)
+
+        for column_index in range(7):
+            calendar_grid.grid_columnconfigure(
+                column_index,
+                weight=1,
+                uniform="calendar_day",
+            )
+
+        def select_calendar_date(day_value):
+            year_value = int(getattr(app, "_save_files_row_date_popup_display_year", initial_date.year) or initial_date.year)
+            month_value = int(getattr(app, "_save_files_row_date_popup_display_month", initial_date.month) or initial_date.month)
+            selected_date = date(
+                year_value,
+                month_value,
+                int(day_value),
+            )
+            today_value = date.today()
+            if selected_date > today_value:
+                selected_date = today_value
+
+            selected_iso = selected_date.isoformat()
+            value_var.set(selected_iso)
+            row_state = row_metadata_state.setdefault(row_key, {})
+            row_state["date_iso"] = selected_iso
+            row_state["date_digits"] = selected_date.strftime("%Y%m%d")
+            close_row_date_popup()
+
+        def draw_calendar_month():
+            for child in calendar_grid.winfo_children():
+                child.destroy()
+
+            year_value = int(getattr(app, "_save_files_row_date_popup_display_year", initial_date.year) or initial_date.year)
+            month_value = int(getattr(app, "_save_files_row_date_popup_display_month", initial_date.month) or initial_date.month)
+            month_title.configure(text=f"{year_value}년 {month_value}월")
+
+            for weekday_index, weekday_text in enumerate(SF_CALENDAR_WEEKDAYS):
+                weekday_label = tk.Label(
+                    calendar_grid,
+                    text=weekday_text,
+                    bg=SF_SURFACE,
+                    fg=(SF_STATUS_FAILED if weekday_index == 6 else SF_TEXT_PLACEHOLDER),
+                    font=app._font(9, "bold"),
+                    anchor="center",
+                    pady=5,
+                )
+                weekday_label.grid(row=0, column=weekday_index, sticky="nsew")
+
+            first_weekday = date(year_value, month_value, 1).weekday()
+            final_day = monthrange(year_value, month_value)[1]
+
+            today_value = date.today()
+            selected_text = str(value_var.get() or "").strip()
+
+            for day_value in range(1, final_day + 1):
+                cell_index = first_weekday + day_value - 1
+                row_index = (cell_index // 7) + 1
+                column_index = cell_index % 7
+
+                iso_value = f"{year_value:04d}-{month_value:02d}-{day_value:02d}"
+                cell_date = date(year_value, month_value, day_value)
+                is_future = cell_date > today_value
+
+                is_selected = selected_text == iso_value and not is_future
+                is_today = (
+                    today_value.year == year_value
+                    and today_value.month == month_value
+                    and today_value.day == day_value
+                )
+
+                day_label = tk.Label(
+                    calendar_grid,
+                    text=str(day_value),
+                    bg=(SF_PRIMARY if is_selected else SF_SURFACE),
+                    fg=(
+                        SF_TEXT_INVERSE
+                        if is_selected
+                        else (
+                            SF_TEXT_PLACEHOLDER
+                            if is_future
+                            else (
+                                SF_PRIMARY
+                                if is_today
+                                else (SF_STATUS_FAILED if column_index == 6 else SF_TEXT_DARK)
+                            )
+                        )
+                    ),
+                    font=app._font(9, "bold" if is_selected or is_today else "normal"),
+                    cursor=("arrow" if is_future else "hand2"),
+                    anchor="center",
+                    padx=4,
+                    pady=6,
+                )
+                day_label.grid(
+                    row=row_index,
+                    column=column_index,
+                    sticky="nsew",
+                    padx=1,
+                    pady=1,
+                )
+
+                def on_day_enter(_event, widget=day_label, selected=is_selected, future=is_future):
+                    if not selected and not future:
+                        widget.configure(bg=SF_SURFACE_HOVER_SOFT)
+
+                def on_day_leave(_event, widget=day_label, selected=is_selected):
+                    widget.configure(bg=(SF_PRIMARY if selected else SF_SURFACE))
+
+                day_label.bind("<Enter>", on_day_enter)
+                day_label.bind("<Leave>", on_day_leave)
+
+                if not is_future:
+                    day_label.bind(
+                        "<Button-1>",
+                        lambda _event, day=day_value: select_calendar_date(day),
+                    )
+
+        def change_calendar_month(direction):
+            current_year = int(getattr(app, "_save_files_row_date_popup_display_year", initial_date.year) or initial_date.year)
+            current_month = int(getattr(app, "_save_files_row_date_popup_display_month", initial_date.month) or initial_date.month)
+            shifted_year, shifted_month = shift_calendar_month(current_year, current_month, direction)
+            app._save_files_row_date_popup_display_year = shifted_year
+            app._save_files_row_date_popup_display_month = shifted_month
+            draw_calendar_month()
+
+        previous_month_control = tk.Label(
+            header,
+            text="‹",
+            width=2,
+            bg=SF_SURFACE,
+            fg=SF_TEXT_DARK,
+            font=app._font(10, "bold"),
+            cursor="hand2",
+            anchor="center",
+            padx=4,
+            pady=3,
+        )
+        previous_month_control.pack(side="left")
+        previous_month_control.bind("<Enter>", lambda _event: previous_month_control.configure(bg=SF_SURFACE_HOVER_SOFT))
+        previous_month_control.bind("<Leave>", lambda _event: previous_month_control.configure(bg=SF_SURFACE))
+        previous_month_control.bind("<Button-1>", lambda _event: (change_calendar_month(-1), "break")[1])
+
+        month_title.pack_forget()
+        month_title.pack(side="left", fill="x", expand=True)
+
+        next_month_control = tk.Label(
+            header,
+            text="›",
+            width=2,
+            bg=SF_SURFACE,
+            fg=SF_TEXT_DARK,
+            font=app._font(10, "bold"),
+            cursor="hand2",
+            anchor="center",
+            padx=4,
+            pady=3,
+        )
+        next_month_control.pack(side="right")
+        next_month_control.bind("<Enter>", lambda _event: next_month_control.configure(bg=SF_SURFACE_HOVER_SOFT))
+        next_month_control.bind("<Leave>", lambda _event: next_month_control.configure(bg=SF_SURFACE))
+        next_month_control.bind("<Button-1>", lambda _event: (change_calendar_month(1), "break")[1])
+
+        footer = tk.Frame(
+            body,
+            bg=SF_SURFACE,
+            highlightthickness=0,
+            bd=0,
+        )
+        footer.pack(fill="x", padx=4, pady=(8, 2))
+
+        today_control = tk.Label(
+            footer,
+            text="오늘",
+            bg=SF_SURFACE,
+            fg=SF_PRIMARY,
+            font=app._font(9, "bold"),
+            cursor="hand2",
+            padx=8,
+            pady=4,
+        )
+        today_control.pack(side="right")
+        today_control.bind(
+            "<Button-1>",
+            lambda _event: (
+                value_var.set(date.today().isoformat()),
+                row_metadata_state.setdefault(row_key, {}).update(
+                    {
+                        "date_iso": date.today().isoformat(),
+                        "date_digits": date.today().strftime("%Y%m%d"),
+                    }
+                ),
+                close_row_date_popup(),
+                "break",
+            )[-1],
+        )
+
+        popup.bind("<Escape>", lambda _event: close_row_date_popup())
+
+        draw_calendar_month()
+
+        app._save_files_row_date_popup = popup
+        app._save_files_row_date_popup_anchor = field_widget
+        app._save_files_row_date_popup_opened_at = time.time()
+        return "break"
+
     def close_row_doc_type_popup():
         popup = getattr(app, "_save_files_row_doc_popup", None)
         if popup is not None and popup.winfo_exists():
@@ -2619,6 +3079,7 @@ def show_save_files_screen(app):
             close_row_doc_type_popup()
             return "break"
 
+        close_row_date_popup()
         close_row_doc_type_popup()
 
         popup_width = max(120, int(field_widget.winfo_width()))
@@ -2695,7 +3156,6 @@ def show_save_files_screen(app):
         listbox.bind("<Double-Button-1>", commit_selection)
         listbox.bind("<Return>", commit_selection)
         popup.bind("<Escape>", lambda _event: close_row_doc_type_popup())
-        popup.bind("<FocusOut>", lambda _event: close_row_doc_type_popup())
         popup.after(0, lambda: listbox.focus_set())
 
         app._save_files_row_doc_popup = popup
@@ -2707,9 +3167,13 @@ def show_save_files_screen(app):
         return "break"
 
     def render_row3_rows():
+        close_row_date_popup()
         close_row_doc_type_popup()
         app._save_files_row_date_entries = []
+        app._save_files_row_doc_entries = []
         app._save_files_row_tag_entries = []
+        app._save_files_row_input_widgets = []
+        app._save_files_row_canvases = []
         for child in row3_body.winfo_children():
             child.destroy()
 
@@ -2764,8 +3228,9 @@ def show_save_files_screen(app):
             empty_canvas.tag_bind("empty_upload_icon", "<Leave>", lambda _event: empty_canvas.configure(cursor="arrow"))
 
         for row_values in rows:
-            row_selected = bool(row_values["checked"])
-            row_bg_color = row_colors[2]
+            row_checked = bool(row_values["checked"])
+            row_highlighted = (highlighted_row_key == row_values["row_key"])
+            row_bg_color = SF_ROW_HIGHLIGHT_BG if row_highlighted else row_colors[2]
             row_primary_text_color = SF_TEXT_MAIN
             row_name_text_color = SF_TEXT_DARK
             row_separator_color = SF_BORDER
@@ -2778,7 +3243,10 @@ def show_save_files_screen(app):
                 highlightthickness=0,
                 bd=0,
             )
+            row_canvas._active_row_width = row2_inner_width
+            row_canvas._active_row_height = table_row_height
             row_canvas.pack(fill="x")
+            app._save_files_row_canvases.append(row_canvas)
             bind_row3_scroll_gestures(row_canvas)
             row_canvas.create_rectangle(
                 0,
@@ -2803,14 +3271,14 @@ def show_save_files_screen(app):
                 (tags_col_left, tags_col_left + tags_col_width),
             )
 
-            check_icon = checked_icon if row_values["checked"] else unchecked_icon
+            check_icon = checked_icon if row_checked else unchecked_icon
             if check_icon is not None:
                 row_canvas.create_image(local_col_centers[0], table_row_height // 2, image=check_icon, anchor="center", tags=("row_item_toggle",))
             else:
                 row_canvas.create_text(
                     local_col_centers[0],
                     table_row_height // 2,
-                    text="☑" if row_values["checked"] else "□",
+                    text="☑" if row_checked else "□",
                     fill=row_name_text_color,
                     font=app._font(12, "bold"),
                     anchor="center",
@@ -2881,7 +3349,7 @@ def show_save_files_screen(app):
             tag_display_value = str(row_values.get("tags", "") or "")
 
             date_var = tk.StringVar(value=date_display_value)
-            date_entry_width = max(52, date_col_width - 12)
+            date_entry_width = max(52, int((date_col_width - 12) * 0.95))
             date_input = RoundedInput(
                 row_canvas,
                 textvariable=date_var,
@@ -2912,18 +3380,16 @@ def show_save_files_screen(app):
             date_input._refresh_visual_state(redraw=True)
 
             date_calendar_icon = row_calendar_icon_dark
-            if date_calendar_icon is not None:
-                date_calendar_label = tk.Label(
-                    date_input,
-                    image=date_calendar_icon,
-                    bg=row_bg_color,
-                    bd=0,
-                    highlightthickness=0,
-                    cursor="hand2",
-                )
-                date_calendar_label.image = date_calendar_icon
-                date_calendar_label.place(relx=1.0, rely=0.5, x=-10, y=0, anchor="e")
-                date_calendar_label.bind("<Button-1>", lambda _event: "break", add="+")
+            date_calendar_action = create_row_field_icon_action(
+                date_input,
+                date_calendar_icon,
+                "📅",
+                lambda field=date_input, key=row_key, var=date_var: app.root.after_idle(
+                    lambda: open_row_date_popup(field, key, var)
+                ),
+                base_bg=row_bg_color,
+            )
+            date_calendar_action.place(relx=1.0, rely=0.5, x=-10, y=0, anchor="e")
 
             def on_date_key_release(_event, row_key=row_key, var=date_var, entry_widget=date_entry):
                 normalized_digits, normalized_text = normalize_date_input(var.get())
@@ -2939,6 +3405,7 @@ def show_save_files_screen(app):
             date_input.bind("<Button-1>", on_date_focus_click)
             date_entry.bind("<Button-1>", on_date_focus_click)
             app._save_files_row_date_entries.append(date_entry)
+            app._save_files_row_input_widgets.append(date_input)
             row_canvas.create_window(
                 date_col_left + (date_col_width / 2.0),
                 table_row_height // 2,
@@ -3022,6 +3489,8 @@ def show_save_files_screen(app):
 
             doc_type_var.trace_add("write", on_doc_type_change)
             doc_type_entry.bind("<KeyPress>", lambda _event: "break", add="+")
+            app._save_files_row_doc_entries.append(doc_type_entry)
+            app._save_files_row_input_widgets.append(doc_type_input)
 
             def on_doc_type_open(_event=None, field=doc_type_input, key=row_key, var=doc_type_var, icon=doc_expand_label, selected=False):
                 app.root.after_idle(lambda: open_row_doc_type_popup(field, key, var, icon, selected))
@@ -3093,6 +3562,7 @@ def show_save_files_screen(app):
             tag_input.bind("<Button-1>", on_tag_focus_click)
             tag_entry.bind("<Button-1>", on_tag_focus_click)
             app._save_files_row_tag_entries.append(tag_entry)
+            app._save_files_row_input_widgets.append(tag_input)
             row_canvas.create_window(
                 tags_col_left + (tags_col_width / 2.0),
                 table_row_height // 2,
@@ -3141,7 +3611,8 @@ def show_save_files_screen(app):
                     tag_widget.focus_input()
                     return "break"
 
-                return select_row_item(key, event)
+                blur_row_metadata_inputs(clicked_widget=event.widget)
+                return highlight_row_item(key)
 
             row_canvas.bind("<Button-1>", on_row_canvas_click, add="+")
 

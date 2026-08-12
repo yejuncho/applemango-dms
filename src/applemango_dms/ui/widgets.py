@@ -912,6 +912,16 @@ class RoundedInput(tk.Frame):
         self._reposition_placeholder()
 
     def _reposition_placeholder(self):
+        should_show = (
+            (not self._has_meaningful_text())
+            and (not self._focused)
+            and bool(self._placeholder_text)
+        )
+
+        if not should_show:
+            self._placeholder_label.place_forget()
+            return
+
         left_pad = getattr(self, "_placeholder_left_pad_override", None)
         right_pad = getattr(self, "_placeholder_right_pad_override", None)
 
