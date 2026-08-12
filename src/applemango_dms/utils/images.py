@@ -7,6 +7,11 @@ except ImportError:
     Image = None
     ImageTk = None
 
+try:
+    import resvg_py
+except ImportError:
+    resvg_py = None
+
 
 """Image helpers used by the Tk UI layer."""
 
@@ -43,7 +48,12 @@ def load_logo_photo(logo_path, max_width, max_height):
 
 def load_svg_photo(svg_path, max_width, max_height, tint=None):
     path = Path(svg_path)
-    if Image is None or ImageTk is None or not path.exists():
+    if (
+        Image is None
+        or ImageTk is None
+        or resvg_py is None
+        or not path.exists()
+    ):
         return None
 
     try:
@@ -51,8 +61,7 @@ def load_svg_photo(svg_path, max_width, max_height, tint=None):
         if tint:
             svg_source = svg_source.replace("currentColor", tint)
 
-        resvg = __import__("resvg_py")
-        png_bytes = resvg.svg_to_bytes(svg_string=svg_source)
+        png_bytes = resvg_py.svg_to_bytes(svg_string=svg_source)
         image = Image.open(BytesIO(png_bytes))
         resized = resize_image_fit(image, max_width=max_width, max_height=max_height)
         return ImageTk.PhotoImage(resized)

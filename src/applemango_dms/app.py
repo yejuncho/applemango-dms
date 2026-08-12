@@ -5,7 +5,6 @@ import random
 import tkinter as tk
 import tkinter.font as tkfont
 import ctypes
-from io import BytesIO
 
 from tkinter import ttk
 from tkinter import filedialog
@@ -19,16 +18,6 @@ try:
 except ImportError:
     Image = None
     ImageTk = None
-
-try:
-    import importlib
-
-    _tkinterdnd2 = importlib.import_module("tkinterdnd2")
-    DND_FILES = _tkinterdnd2.DND_FILES
-    TkinterDnD = _tkinterdnd2.TkinterDnD
-except ImportError:
-    DND_FILES = None
-    TkinterDnD = None
 
 import applemango_dms.config as config
 
@@ -114,7 +103,6 @@ from applemango_dms.ui.search_files import (
 
 from applemango_dms.ui.settings import (
     show_settings_screen as ui_show_settings_screen,
-    show_change_server_name_dialog as ui_show_change_server_name_dialog,
 )
 
 from applemango_dms.ui.workspace_shell import (
@@ -133,7 +121,7 @@ from applemango_dms.utils.images import (
 )
 class SequenceArchiverApp:
     def __init__(self):
-        self.root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
+        self.root = tk.Tk()
         self._force_fullscreen = False
         self._window_controls_refreshers = []
         apply_window_icon(self.root)
@@ -435,32 +423,22 @@ class SequenceArchiverApp:
         if not path.exists():
             return None
 
-        if Image is not None and ImageTk is not None:
-            if path.suffix.lower() == ".svg":
-                try:
-                    resvg = __import__("resvg_py")
-                    svg_source = path.read_text(encoding="utf-8")
-                    # Lucide SVGs commonly use currentColor; replace with app icon tone.
-                    svg_source = svg_source.replace("currentColor", "#5a647f")
-                    png_bytes = resvg.svg_to_bytes(svg_string=svg_source)
-                    image = Image.open(BytesIO(png_bytes))
-                    resized = self._resize_image_fit(image, max_width=max_width, max_height=max_height)
-                    return ImageTk.PhotoImage(resized)
-                except Exception:
-                    pass
+        if path.suffix.lower() == ".svg":
+            return load_svg_photo(
+                path,
+                max_width=max_width,
+                max_height=max_height,
+                tint="#5a647f",
+            )
 
+        if (
+            Image is not None
+            and ImageTk is not None
+        ):
             try:
                 image = Image.open(path)
                 resized = self._resize_image_fit(image, max_width=max_width, max_height=max_height)
                 return ImageTk.PhotoImage(resized)
-            except Exception:
-                pass
-
-            try:
-                cairosvg = __import__("cairosvg")
-                png_bytes = cairosvg.svg2png(url=str(path), output_width=max_width, output_height=max_height)
-                image = Image.open(BytesIO(png_bytes))
-                return ImageTk.PhotoImage(image)
             except Exception:
                 pass
 
@@ -685,9 +663,23 @@ class SequenceArchiverApp:
         return config.DEMO_WORKSPACES_DIR
 
     def _ensure_demo_workspace_root(self):
-        root = self._get_demo_workspace_base_path()
-        if not root.exists() or not root.is_dir():
-            raise FileNotFoundError("No local demo directory found")
+        try:
+            root = (
+                config.ensure_demo_runtime_data()
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Demo runtime data could not "
+                "be prepared."
+            ) from exc
+
+        if (
+            not root.exists()
+            or not root.is_dir()
+        ):
+            raise FileNotFoundError(
+                "No local demo directory found"
+            )
 
         return root
 
@@ -801,6 +793,53 @@ class SequenceArchiverApp:
         if self._is_file_operation_active():
             raise RuntimeError(
                 "A critical operation is active. Cannot designate workspace right now."
+            )
+
+        normalized_workspace_name = str(
+            workspace_name or ""
+        ).strip()
+
+        reserved_names = {
+            str(value).strip().casefold()
+            for value in config.RESERVED_NAS_SHARE_NAMES
+        }
+
+        if (
+            not state.is_demo_mode
+            and normalized_workspace_name.casefold()
+                in reserved_names
+        ):
+            raise ValueError(
+                "This NAS share is reserved for "
+                "Applemango internal data and cannot "
+                "be designated as a workspace."
+            )
+
+        normalized_share_path = str(
+            share_path or ""
+        ).strip().replace("/", "\\").rstrip("\\")
+
+        share_parts = [
+            part
+            for part in normalized_share_path.split("\\")
+            if part
+        ]
+
+        share_name_from_path = (
+            share_parts[-1]
+            if share_parts
+            else ""
+        )
+
+        if (
+            not state.is_demo_mode
+            and share_name_from_path.casefold()
+                in reserved_names
+        ):
+            raise ValueError(
+                "This NAS share is reserved for "
+                "Applemango internal data and cannot "
+                "be designated as a workspace."
             )
 
         workspace = self.db.designate_workspace(
@@ -1156,9 +1195,6 @@ class SequenceArchiverApp:
 
     def show_document_type_management_screen(self):
         return ui_show_document_type_management_screen(self)
-
-    def show_change_server_name_dialog(self, parent_win):
-        return ui_show_change_server_name_dialog(self, parent_win)
 
     def show_settings_screen(self):
         if self._is_file_operation_active():

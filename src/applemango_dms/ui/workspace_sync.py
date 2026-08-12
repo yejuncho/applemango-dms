@@ -984,6 +984,8 @@ def show_sync_workspace_screen(app):
         "failure_message": "",
         "last_apply_inserted_count": 0,
         "last_apply_failed_count": 0,
+        "last_apply_marked_missing_count": 0,
+        "last_apply_restored_active_count": 0,
         "worker_events": queue.Queue(),
         "worker_poll_job": None,
     }
@@ -1315,6 +1317,73 @@ def show_sync_workspace_screen(app):
             return ""
         return Path(text).as_posix().casefold()
 
+    def _derive_actionable_sync_counts(
+        scan_report,
+    ):
+        if not isinstance(scan_report, dict):
+            return {
+                "registration_required": 0,
+                "mark_missing_required": 0,
+                "restore_active_required": 0,
+                "total": 0,
+            }
+
+        registration_required = len(
+            scan_report.get("unindexed_files") or []
+        )
+
+        mark_missing_required = 0
+
+        for database_record in (
+            scan_report.get("missing_from_storage") or []
+        ):
+            if (
+                str(
+                    database_record.get("status") or ""
+                ).strip().lower()
+                == "active"
+            ):
+                mark_missing_required += 1
+
+        restore_active_required = 0
+
+        for matched_record in (
+            scan_report.get("matched_files") or []
+        ):
+            database_record = (
+                matched_record.get("database_record")
+                if isinstance(matched_record, dict)
+                else None
+            )
+
+            if not isinstance(database_record, dict):
+                continue
+
+            if (
+                str(
+                    database_record.get("status") or ""
+                ).strip().lower()
+                == "missing"
+            ):
+                restore_active_required += 1
+
+        total = (
+            registration_required
+            + mark_missing_required
+            + restore_active_required
+        )
+
+        return {
+            "registration_required":
+                registration_required,
+            "mark_missing_required":
+                mark_missing_required,
+            "restore_active_required":
+                restore_active_required,
+            "total":
+                total,
+        }
+
     def _derive_workspace_identity():
         workspace_id, workspace_name, workspace_root = _resolve_workspace_context(app)
         runtime["workspace_id"] = workspace_id
@@ -1395,6 +1464,95 @@ def show_sync_workspace_screen(app):
                 }
             )
 
+        matched_records = list(
+            scan_report.get("matched_files") or []
+        )
+
+        for matched_record in matched_records:
+            if not isinstance(
+                matched_record,
+                dict,
+            ):
+                continue
+
+            database_record = matched_record.get(
+                "database_record"
+            )
+
+            if not isinstance(
+                database_record,
+                dict,
+            ):
+                continue
+
+            if (
+                str(
+                    database_record.get("status")
+                    or ""
+                ).strip().lower()
+                != "missing"
+            ):
+                continue
+
+            file_record = (
+                matched_record.get("file")
+                or {}
+            )
+
+            relative_path = str(
+                database_record.get(
+                    "relative_path"
+                )
+                or file_record.get(
+                    "relative_path"
+                )
+                or ""
+            ).strip()
+
+            record_id = database_record.get(
+                "file_id"
+            )
+
+            filename = str(
+                database_record.get(
+                    "archived_filename"
+                )
+                or file_record.get(
+                    "archived_filename"
+                )
+                or Path(relative_path).name
+                or "-"
+            )
+
+            identity = (
+                str(record_id)
+                if record_id is not None
+                else _normalize_relpath_key(
+                    relative_path
+                )
+            )
+
+            items.append(
+                {
+                    "item_id":
+                        f"restore:{identity}",
+                    "status":
+                        "review_required",
+                    "filename":
+                        filename,
+                    "relative_path":
+                        relative_path or "-",
+                    "size_bytes":
+                        file_record.get(
+                            "file_size"
+                        ),
+                    "detail":
+                        "파일이 다시 확인되어 DMS 상태 복구 필요",
+                    "record_id":
+                        record_id,
+                }
+            )
+
         scan_errors = list(scan_report.get("errors") or [])
         for idx, error in enumerate(scan_errors):
             error_path = str(error.get("path") or "").strip()
@@ -1428,11 +1586,51 @@ def show_sync_workspace_screen(app):
 
         detail_items = _build_detail_items_from_scan(scan_report)
 
+        actionable_counts = (
+            _derive_actionable_sync_counts(
+                scan_report
+            )
+        )
+
+        matched_files = list(
+            scan_report.get("matched_files") or []
+        )
+
+        restore_active_required = int(
+            actionable_counts[
+                "restore_active_required"
+            ]
+        )
+
+        normal_count = max(
+            0,
+            len(matched_files)
+            - restore_active_required,
+        )
+
         summary = {
-            "normal": len(scan_report.get("matched_files") or []),
-            "registration_required": len(scan_report.get("unindexed_files") or []),
-            "review_required": len(scan_report.get("missing_from_storage") or []),
+            "normal": normal_count,
+            "registration_required": len(
+                scan_report.get(
+                    "unindexed_files"
+                ) or []
+            ),
+            "review_required": (
+                len(
+                    scan_report.get(
+                        "missing_from_storage"
+                    ) or []
+                )
+                + restore_active_required
+            ),
             "error": len(scan_report.get("errors") or []),
+            "mark_missing_required": int(
+                actionable_counts[
+                    "mark_missing_required"
+                ]
+            ),
+            "restore_active_required":
+                restore_active_required,
         }
 
         status_meta = _status_for_summary(summary)
@@ -1986,6 +2184,18 @@ def show_sync_workspace_screen(app):
 
         inserted_count = int(payload.get("inserted_count") or 0)
         failed_count = int(payload.get("failed_count") or 0)
+        marked_missing_count = int(
+            payload.get(
+                "marked_missing_count"
+            )
+            or 0
+        )
+        restored_active_count = int(
+            payload.get(
+                "restored_active_count"
+            )
+            or 0
+        )
         verified_sync_success = bool(
             payload.get("verified_sync_success")
         )
@@ -1993,6 +2203,12 @@ def show_sync_workspace_screen(app):
         try:
             runtime["last_apply_inserted_count"] = inserted_count
             runtime["last_apply_failed_count"] = failed_count
+            runtime[
+                "last_apply_marked_missing_count"
+            ] = marked_missing_count
+            runtime[
+                "last_apply_restored_active_count"
+            ] = restored_active_count
 
             snapshot = _build_ui_snapshot_from_workflow(
                 workflow,
@@ -3448,8 +3664,29 @@ def show_sync_workspace_screen(app):
             return
 
         summary = dict((runtime.get("latest_snapshot") or {}).get("summary") or {})
-        registration_required = int(summary.get("registration_required") or 0)
-        if registration_required <= 0:
+        actionable_counts = (
+            _derive_actionable_sync_counts(
+                latest_scan_report
+            )
+        )
+
+        actionable_total = int(
+            actionable_counts["total"]
+        )
+
+        error_count = int(
+            summary.get("error") or 0
+        )
+
+        if error_count > 0:
+            _set_sync_card_state(
+                SYNC_CARD_STATE_RESULT,
+                summary=summary,
+                failure_message="",
+            )
+            return
+
+        if actionable_total <= 0:
             _set_sync_card_state(
                 SYNC_CARD_STATE_RESULT,
                 summary=summary,
@@ -3477,7 +3714,7 @@ def show_sync_workspace_screen(app):
             SYNC_CARD_STATE_SYNCING,
             summary=summary,
             processed=0,
-            total=registration_required,
+            total=actionable_total,
             message="데이터베이스를 동기화하고 있어요.",
             failure_message="",
         )
@@ -3499,6 +3736,25 @@ def show_sync_workspace_screen(app):
                 apply_result = workflow.get("apply_result") or {}
                 inserted_count = int(apply_result.get("inserted_count") or 0)
                 failed_count = int(apply_result.get("failed_count") or 0)
+
+                workflow_summary = (
+                    workflow.get("summary")
+                    or {}
+                )
+
+                marked_missing_count = int(
+                    workflow_summary.get(
+                        "marked_missing_count"
+                    )
+                    or 0
+                )
+
+                restored_active_count = int(
+                    workflow_summary.get(
+                        "restored_active_count"
+                    )
+                    or 0
+                )
 
                 verified_sync_success = _is_verified_sync_success(
                     workflow
@@ -3545,6 +3801,8 @@ def show_sync_workspace_screen(app):
                         "verified_sync_success": verified_sync_success,
                         "inserted_count": inserted_count,
                         "failed_count": failed_count,
+                        "marked_missing_count": marked_missing_count,
+                        "restored_active_count": restored_active_count,
                     },
                 )
 
@@ -3696,12 +3954,59 @@ def show_sync_workspace_screen(app):
 
         _render_summary_area(summary)
 
-        registration_required = int(summary.get("registration_required", 0))
         review_required = int(summary.get("review_required", 0))
         error_count = int(summary.get("error", 0))
 
+        actionable_counts = (
+            _derive_actionable_sync_counts(
+                runtime.get(
+                    "latest_scan_report"
+                )
+            )
+        )
+
+        actionable_total = int(
+            actionable_counts["total"]
+        )
+
         if state_name == SYNC_CARD_STATE_COMPLETE:
             inserted_count = int(runtime.get("last_apply_inserted_count") or 0)
+            marked_missing_count = int(
+                runtime.get(
+                    "last_apply_marked_missing_count"
+                )
+                or 0
+            )
+            restored_active_count = int(
+                runtime.get(
+                    "last_apply_restored_active_count"
+                )
+                or 0
+            )
+
+            completion_parts = []
+
+            if inserted_count:
+                completion_parts.append(
+                    f"신규 등록 {inserted_count}개"
+                )
+
+            if marked_missing_count:
+                completion_parts.append(
+                    f"누락 상태 반영 {marked_missing_count}개"
+                )
+
+            if restored_active_count:
+                completion_parts.append(
+                    f"복구 상태 반영 {restored_active_count}개"
+                )
+
+            completion_text = (
+                " · ".join(completion_parts)
+                if completion_parts
+                else "데이터베이스 상태를 확인했어요."
+            )
+
             tk.Label(
                 sync_card_content,
                 text="동기화가 완료되었어요.",
@@ -3713,7 +4018,7 @@ def show_sync_workspace_screen(app):
 
             tk.Label(
                 sync_card_content,
-                text=f"{_format_grouped_number(inserted_count, fallback='0')}개의 파일 정보를 DMS 데이터베이스에 등록했어요.",
+                text=completion_text,
                 font=app._font(10),
                 fg=SYNC_TEXT_LABEL,
                 bg=SYNC_CARD_BG,
@@ -3740,7 +4045,15 @@ def show_sync_workspace_screen(app):
 
         tk.Label(
             sync_card_content,
-            text=f"{_format_grouped_number(registration_required, fallback='0')}개 파일을 DMS 데이터베이스에 등록할 수 있어요.",
+            text=(
+                f"{_format_grouped_number(actionable_total, fallback='0')}개 항목에 동기화 변경을 적용할 수 있어요."
+                if actionable_total > 0
+                else (
+                    "확인 필요 항목이 있지만 지금 적용할 동기화 변경은 없어요."
+                    if review_required > 0
+                    else "적용 가능한 동기화 변경 항목이 없어요."
+                )
+            ),
             font=app._font(11, "bold"),
             fg=SYNC_TEXT_TITLE,
             bg=SYNC_CARD_BG,
@@ -3770,8 +4083,8 @@ def show_sync_workspace_screen(app):
         tk.Label(
             helper_row,
             text=(
-                "자동 동기화란 NAS에 존재하지만 DMS에 등록되지 않은 파일 정보를\n"
-                "DMS 데이터베이스에 추가하는 작업이에요."
+                "자동 동기화는 NAS에 새로 발견된 파일을 DMS에 등록하고,\n"
+                "파일의 실제 존재 상태에 맞춰 누락 및 복구 상태를 반영해요."
             ),
             font=app._font(10),
             fg=SYNC_TEXT_LABEL,
@@ -3781,12 +4094,30 @@ def show_sync_workspace_screen(app):
             wraplength=500,
         ).pack(side="left", fill="x", expand=True)
 
+        latest_scan_report = (
+            runtime.get(
+                "latest_scan_report"
+            )
+        )
+
+        actionable_counts = (
+            _derive_actionable_sync_counts(
+                latest_scan_report
+            )
+        )
+
+        actionable_total = int(
+            actionable_counts["total"]
+        )
+
         can_auto_sync = (
-            (registration_required > 0)
-            and (review_required >= 0)
-            and (error_count >= 0)
-            and (not runtime["busy"])
-            and isinstance(runtime.get("latest_scan_report"), dict)
+            actionable_total > 0
+            and error_count == 0
+            and not runtime["busy"]
+            and isinstance(
+                latest_scan_report,
+                dict,
+            )
         )
 
         if can_auto_sync:

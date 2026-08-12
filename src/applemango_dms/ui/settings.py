@@ -802,88 +802,6 @@ def show_mapped_drives_window(app, root):
     listbox.bind("<<ListboxSelect>>", update_unmap_button)
     unmap_btn.config(command=unmap_selected_drives)
 
-def show_change_server_name_dialog(app, parent_win):
-    if app._is_file_operation_active():
-        app._show_file_operation_blocked_message()
-        return
-
-    dialog = tk.Toplevel(parent_win)
-    dialog.title("서버 이름 변경")
-    dialog.geometry("380x190")
-    dialog.configure(bg="white")
-    dialog.transient(parent_win)
-
-    body = tk.Frame(dialog, bg="white", padx=16, pady=14)
-    body.pack(fill="both", expand=True)
-
-    current_name = config.default_server_name.lstrip("\\")
-    tk.Label(body, text=f"현재 서버 이름: {current_name or '(없음)'}", bg="white", anchor="w").pack(fill="x", pady=(0, 8))
-
-    tk.Label(body, text="새 서버 이름", bg="white", anchor="w").pack(fill="x")
-    new_server_var = tk.StringVar(value="")
-    entry = tk.Entry(body, textvariable=new_server_var)
-    entry.pack(fill="x", pady=(2, 10))
-
-    button_row = tk.Frame(body, bg="white")
-    button_row.pack(fill="x")
-
-    apply_btn = tk.Button(
-        button_row,
-        text="적용",
-        width=12,
-        state="disabled",
-        bg="#d9d9d9",
-        fg="black",
-        activebackground="#c0c0c0",
-        relief="flat",
-        bd=0,
-        cursor="hand2",
-    )
-    apply_btn.pack(side="left")
-
-    tk.Button(
-        button_row,
-        text="취소",
-        width=12,
-        bg="#d9d9d9",
-        activebackground="#c0c0c0",
-        relief="flat",
-        bd=0,
-        cursor="hand2",
-        command=dialog.destroy,
-    ).pack(side="left", padx=(8, 0))
-
-    def update_apply_button(*_):
-        has_name = bool(new_server_var.get().strip())
-        if has_name:
-            apply_btn.config(state="normal", bg="#4caf50", fg="white", activebackground="#43a047")
-        else:
-            apply_btn.config(state="disabled", bg="#d9d9d9", fg="black", activebackground="#c0c0c0")
-
-    def apply_server_name():
-        if app._is_file_operation_active():
-            app._show_file_operation_blocked_message()
-            return
-
-        cleaned = new_server_var.get().strip().lstrip("\\")
-        if not cleaned:
-            return
-
-        if state.active_workspace_drive and app.workspace_drive_mapped_by_app:
-            app.workspace_manager.unmap_drive(state.active_workspace_drive)
-
-        config.default_server_name = f"\\\\{cleaned}"
-        app.clear_workspace(unmap_if_needed=False)
-        messagebox.showinfo("설정", f"서버 이름이 {config.default_server_name}(으)로 변경되었습니다.", parent=dialog)
-        dialog.destroy()
-        app.show_workspace_selection_screen()
-
-    new_server_var.trace_add("write", update_apply_button)
-    apply_btn.config(command=apply_server_name)
-    update_apply_button()
-    entry.focus_set()
-
-
 def show_settings_screen(app):
     existing = getattr(app, "_settings_window", None)
     if existing is not None and existing.winfo_exists():
@@ -1083,7 +1001,6 @@ def show_settings_screen(app):
             "delete_credentials.svg",
             tint=SETTINGS_TEXT_DANGER,
         ),
-        "server": _load_settings_icon(settings_win, "server_settings.svg"),
         "workspace": _load_settings_icon(settings_win, "workspace_settings.svg"),
         "network": _load_settings_icon(settings_win, "network_drive_settings.svg"),
         "theme": _load_settings_icon(settings_win, "theme.svg"),
@@ -1129,13 +1046,6 @@ def show_settings_screen(app):
     system_rows = tk.Frame(scroll_body, bg=SETTINGS_CARD_BG, highlightthickness=0, bd=0)
     system_rows.pack(fill="x", padx=(SETTINGS_ROW_SIDE_PAD, SETTINGS_ROW_SIDE_PAD))
 
-    create_settings_row(
-        app,
-        system_rows,
-        title="서버 설정",
-        icon_photo=icon_map["server"],
-        command=lambda: show_change_server_name_dialog(app, settings_win),
-    ).pack(fill="x", pady=4)
     create_settings_row(
         app,
         system_rows,

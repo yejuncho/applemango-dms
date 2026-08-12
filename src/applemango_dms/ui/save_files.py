@@ -22,16 +22,6 @@ from applemango_dms.ui.workplace_menu import render_workspace_sidebar_nav
 from applemango_dms.ui.widgets import RoundedInput
 from applemango_dms.utils.images import load_logo_photo, load_svg_photo
 
-try:
-    import importlib
-
-    _tkinterdnd2 = importlib.import_module("tkinterdnd2")
-    DND_FILES = _tkinterdnd2.DND_FILES
-    TkinterDnD = _tkinterdnd2.TkinterDnD
-except ImportError:
-    DND_FILES = None
-    TkinterDnD = None
-
 SF_SURFACE = colors.SURFACE_ALT
 SF_SURFACE_ALT = colors.SURFACE_ACCENT_SOFT
 SF_ACCENT = colors.SURFACE_ACCENT_SOFT
@@ -599,21 +589,35 @@ def show_save_files_screen(app):
 
                         shutil.copystat(source, staging_path)
 
-                        resolve_attempts = 0
-                        while destination_path.exists():
-                            archived_name = app.filename_builder.ensure_unique_name(
-                                destination,
-                                candidate_name,
-                                reserved_names=reserved_names,
-                            )
-                            destination_path = destination / archived_name
-                            resolve_attempts += 1
-                            if resolve_attempts >= 32 and destination_path.exists():
-                                raise FileExistsError(
-                                    "Unable to resolve a unique archive name before publication."
+                        publish_attempts = 0
+
+                        while True:
+                            try:
+                                os.rename(
+                                    staging_path,
+                                    destination_path,
                                 )
 
-                        os.replace(staging_path, destination_path)
+                            except FileExistsError:
+                                publish_attempts += 1
+
+                                if publish_attempts >= 32:
+                                    raise FileExistsError(
+                                        "Unable to resolve a unique archive name during publication."
+                                    )
+
+                                archived_name = app.filename_builder.ensure_unique_name(
+                                    destination,
+                                    candidate_name,
+                                    reserved_names=reserved_names,
+                                )
+
+                                destination_path = destination / archived_name
+
+                                continue
+
+                            break
+
                         final_published = True
                         staging_path = None
 

@@ -1,11 +1,29 @@
 from pathlib import Path
 
+import applemango_dms.config as config
+
 from applemango_dms.services.nas import (
     discover_server_shares,
 )
 
 WORKSPACE_SOURCE_NAS = "nas"
 WORKSPACE_SOURCE_DEMO = "demo"
+
+
+def _is_reserved_nas_share_name(
+    name,
+):
+    normalized = str(
+        name or ""
+    ).strip().casefold()
+
+    if not normalized:
+        return False
+
+    return normalized in {
+        str(value).strip().casefold()
+        for value in config.RESERVED_NAS_SHARE_NAMES
+    }
 
 
 def _normalize_discovered_names(names):
@@ -117,6 +135,14 @@ def discover_nas_workspace_candidates(
     normalized_names = _normalize_discovered_names(
         names
     )
+
+    normalized_names = [
+        name
+        for name in normalized_names
+        if not _is_reserved_nas_share_name(
+            name
+        )
+    ]
 
     return [
         {

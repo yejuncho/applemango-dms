@@ -161,6 +161,10 @@ class ArchiveDatabase:
                 """
             )
 
+            self._migrate_document_types_sort_order(
+                conn
+            )
+
             self._create_files_table(
                 conn,
                 table_name="files",
@@ -210,6 +214,10 @@ class ArchiveDatabase:
             )
 
             self._migrate_files_reconciliation_columns(
+                conn
+            )
+
+            self._migrate_files_status_constraint(
                 conn
             )
 
@@ -722,6 +730,72 @@ class ArchiveDatabase:
                 ADD COLUMN discovered_at TEXT;
                 """
             )
+
+    def _migrate_document_types_sort_order(
+        self,
+        conn,
+    ):
+        rows = conn.execute(
+            """
+            PRAGMA table_info(document_types);
+            """
+        ).fetchall()
+
+        existing_columns = {
+            str(row["name"])
+            for row in rows
+        }
+
+        if "sort_order" in existing_columns:
+            return False
+
+        conn.execute(
+            """
+            ALTER TABLE document_types
+            ADD COLUMN sort_order INTEGER NOT NULL
+                DEFAULT 0;
+            """
+        )
+
+        return True
+
+    def _files_supports_missing_status(
+        self,
+        conn,
+    ):
+        row = conn.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'files'
+            LIMIT 1;
+            """
+        ).fetchone()
+
+        if row is None:
+            return True
+
+        create_sql = str(
+            row["sql"] or ""
+        ).casefold()
+
+        return "'missing'" in create_sql
+
+    def _migrate_files_status_constraint(
+        self,
+        conn,
+    ):
+        if self._files_supports_missing_status(
+            conn
+        ):
+            return False
+
+        self._rebuild_files_table_preserving_rows(
+            conn
+        )
+
+        return True
 
     def _migrate_workspaces_reconciliation_columns(
         self,
